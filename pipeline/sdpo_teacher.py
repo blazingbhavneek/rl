@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -7,7 +8,6 @@ import torch
 from tqdm.auto import tqdm
 
 from algo.sdpo import SDPOAlgo
-from client.agent import AgentClient
 from client.base import BaseClient, ClientContext
 from tasksets.base import Problem
 
@@ -21,12 +21,14 @@ from .base import (
     TeacherHintResult,
 )
 
+log = logging.getLogger(__name__)
+
 
 class SDPOTeacherPipeline(BasePipeline):
     def __init__(
         self,
         student_client: BaseClient,
-        teacher_client: AgentClient,
+        teacher_client: BaseClient,
         verifier,
         algo: SDPOAlgo,
         backprop,
@@ -67,9 +69,17 @@ class SDPOTeacherPipeline(BasePipeline):
         sft_stats: Dict[str, float] = {}
         sft_pairs: List[SFTPair] = []
         if self.sft_output_dir is not None:
+            log.info("teacher phase start: problems=%s", len(problem_rollouts))
             teacher_stats, sft_pairs = self._run_teacher_phase(problem_rollouts)
             sft_phase_stats = self._run_sft_phase(sft_pairs)
             sft_stats = {**teacher_stats, **sft_phase_stats}
+            log.info(
+                "teacher phase done: hints=%s passed_after_hint=%s pairs_saved=%s pairs_trained=%s",
+                int(sft_stats.get("n_hints_given", 0.0)),
+                int(sft_stats.get("n_passed_after_hint", 0.0)),
+                int(sft_stats.get("n_pairs_saved", 0.0)),
+                int(sft_stats.get("n_pairs_trained", 0.0)),
+            )
 
         step_stats = {
             **rl_stats,
@@ -256,7 +266,10 @@ class SDPOTeacherPipeline(BasePipeline):
         n_pairs_saved = 0
         pairs: List[SFTPair] = []
 
-        for pr in problem_rollouts:
+        teacher_iter = problem_rollouts
+        if self.show_tqdm:
+            teacher_iter = tqdm(problem_rollouts, total=len(problem_rollouts), desc="teacher-hints", leave=False)
+        for pr in teacher_iter:
             failed = [r for r in pr.rollouts if not r.passed]
             for fr in failed:
                 out = self._run_hint_loop(pr.problem, fr, pr.peer_solution)
@@ -264,6 +277,12 @@ class SDPOTeacherPipeline(BasePipeline):
                 n_passed_after_hint += int(out.get("passed", 0))
                 n_pairs_saved += int(out.get("pairs", 0))
                 pairs.extend(out.get("pair_objects", []))
+            if self.show_tqdm and hasattr(teacher_iter, "set_postfix"):
+                teacher_iter.set_postfix(
+                    hints=n_hints_given,
+                    passed=n_passed_after_hint,
+                    pairs=n_pairs_saved,
+                )
 
         return (
             {

@@ -23,16 +23,23 @@ ATTN_IMPLEMENTATION = "sdpa"
 
 # Inference engine wiring and default generation budgets.
 USE_SERVER_ENGINE = False
+OFFLINE_ENGINE_BACKEND = "sglang"  # "sglang" | "vllm"
 SERVER_URL = "http://127.0.0.1:30000"
 SERVER_MODEL = "default"
+# Optional teacher override endpoint/model for AgentClient.
+# If None, teacher uses SERVER_URL/SERVER_MODEL (same running engine endpoint).
+TEACHER_SERVER_URL = None
+TEACHER_SERVER_MODEL = None
 SGLANG_MEM_FRAC = 0.3
+VLLM_GPU_MEMORY_UTILIZATION = 0.9
+INFERENCE_QUANTIZATION = None  # e.g. "awq", "gptq"; None = default engine behavior
 MAX_SEQ_LEN = 8192
 MAX_COMPLETION_TOKENS = 4096
 TEMPERATURE = 0.7
 TOP_P = 0.95
 ENGINE_POLL_INTERVAL_S = 10.0
-# SGLang Qwen3.5 LoRA loader currently fails on some builds
-# ('Qwen3_5Config' has no 'num_hidden_layers'). Keep False to train safely.
+# Whether to hot-swap latest LoRA into inference engine every step.
+# Keep False if your selected backend cannot load your adapter reliably.
 SYNC_ENGINE_LORA = False
 # Safety margin to avoid boundary context-length rejections from the engine.
 CONTEXT_SAFETY_MARGIN = 64
@@ -60,6 +67,11 @@ TEACHER_SYSTEM_PROMPT = (
     "You are a programming tutor. Diagnose the student's reasoning error and provide a targeted hint. "
     "Do not reveal the final answer."
 )
+# Teacher generation controls (used by AgentClient and SimpleTurn fallback).
+# Keep this high for long-horizon hinting with RAG/tool traces.
+TEACHER_MAX_COMPLETION_TOKENS = 32768
+# OpenAI-compatible reasoning effort: "low" | "medium" | "high" (or None to disable).
+TEACHER_REASONING_EFFORT = "medium"
 
 # Optimizer/scheduler and gradient clipping.
 LR = 5e-6
@@ -90,9 +102,9 @@ MIN_COMPLETION_TOKENS = 64
 REWARD_ERROR_ENGAGE = 0.1
 
 # Teacher phase controls (only active when USE_TEACHER_PIPELINE=True and SFT output enabled).
-USE_TEACHER_PIPELINE = False
+USE_TEACHER_PIPELINE = True
 MAX_HINT_ATTEMPTS = 3
-SFT_OUTPUT_DIR = None
+SFT_OUTPUT_DIR = f"{OUTPUT_DIR}/sft_pairs"
 
 # Optional teacher RAG config.
 TEACHER_DOCS_FOLDER = None

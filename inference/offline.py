@@ -3,7 +3,9 @@ from __future__ import annotations
 import logging
 import argparse
 import os
+import json
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
@@ -30,6 +32,7 @@ class SGLangOfflineEngine(BaseEngine):
         # TODO: remove for other GPU architectures; Blackwell hybrid GDN currently
         # requires triton or trtllm_mha attention backend in SGLang.
         self.engine_kwargs.setdefault("attention_backend", "triton")
+        self._apply_model_compat_overrides()
         self.health_prompt = health_prompt
         self._active_lora_path: Optional[str] = None
         self._supports_generate_lora_path: Optional[bool] = None
@@ -43,6 +46,16 @@ class SGLangOfflineEngine(BaseEngine):
         *,
         engine_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
+        # Some environments disallow writing to ~/.cache (e.g. sandboxed runs).
+        # Force cache locations to a local writable directory for sglang/flashinfer jit artifacts.
+        local_cache = Path.cwd() / ".cache"
+        local_cache.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("XDG_CACHE_HOME", str(local_cache))
+        os.environ.setdefault("FLASHINFER_CACHE_DIR", str(local_cache / "flashinfer"))
+        os.environ.setdefault("FLASHINFER_JIT_CACHE_DIR", str(local_cache / "flashinfer"))
+        Path(os.environ["FLASHINFER_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
+        Path(os.environ["FLASHINFER_JIT_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
+
         import sglang as sgl
         from transformers import AutoTokenizer
 
@@ -50,6 +63,59 @@ class SGLangOfflineEngine(BaseEngine):
         self.engine = sgl.Engine(model_path=model_path, **kwargs)
         self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_path)
         self.model_path = model_path
+
+    def _merge_json_model_override_args(self, extra: Dict[str, Any]) -> None:
+        raw = self.engine_kwargs.get("json_model_override_args", "{}")
+        merged: Dict[str, Any] = {}
+        try:
+            if isinstance(raw, str):
+                merged = json.loads(raw) if raw.strip() else {}
+            elif isinstance(raw, dict):
+                merged = dict(raw)
+        except Exception:
+            merged = {}
+        merged.update(extra)
+        self.engine_kwargs["json_model_override_args"] = json.dumps(merged, ensure_ascii=False)
+
+    def _apply_model_compat_overrides(self) -> None:
+        """
+        SGLang LoRA loader for qwen3_5 currently expects top-level text fields
+        like `num_hidden_layers`, while multimodal configs keep those under
+        `text_config`. Inject a safe override to avoid LoRA init failures.
+        """
+        cfg_path = Path(self.model_path) / "config.json"
+        if not cfg_path.exists():
+            return
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(cfg, dict) or cfg.get("model_type") != "qwen3_5":
+            return
+        text_cfg = cfg.get("text_config")
+        if not isinstance(text_cfg, dict):
+            return
+
+        extra: Dict[str, Any] = {}
+        for k in (
+            "num_hidden_layers",
+            "hidden_size",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "head_dim",
+            "layer_types",
+            "max_position_embeddings",
+            "vocab_size",
+        ):
+            if k in text_cfg:
+                extra[k] = text_cfg[k]
+        if not extra:
+            return
+        self._merge_json_model_override_args(extra)
+        log.warning(
+            "Applied qwen3_5 text-config compatibility overrides for SGLang LoRA: %s",
+            sorted(extra.keys()),
+        )
 
     def _reboot_with_static_lora(self, lora_path: str) -> None:
         # Fallback for environments where generate(..., lora_path=...) is unsupported.
@@ -273,6 +339,8 @@ class VLLMOfflineEngine(BaseEngine):
 
     def swap_weights(self, checkpoint_path: str, mode: WeightSwapMode) -> None:
         if mode == WeightSwapMode.LORA:
+            if not self.enable_lora:
+                raise RuntimeError("vLLM engine was created with enable_lora=False.")
             self._active_lora_path = checkpoint_path
             return
 

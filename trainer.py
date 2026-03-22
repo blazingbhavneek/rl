@@ -4,6 +4,8 @@ import argparse
 import json
 import logging
 import time
+import urllib.error
+import urllib.request
 from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -21,6 +23,7 @@ from inference import (
     EngineManager,
     SGLangOfflineEngine,
     ServerEngine,
+    VLLMOfflineEngine,
     WeightSwapMode,
 )
 from pipeline import SDPOTeacherPipeline
@@ -175,17 +178,33 @@ class Trainer:
         )
 
     def _make_engine(self) -> BaseEngine:
-        if cfg.USE_SERVER_ENGINE or cfg.USE_TEACHER_PIPELINE:
+        if cfg.USE_SERVER_ENGINE:
             return ServerEngine(base_url=cfg.SERVER_URL, model=cfg.SERVER_MODEL)
-        return SGLangOfflineEngine(
-            cfg.MODEL_PATH,
-            engine_kwargs={
+        backend = str(getattr(cfg, "OFFLINE_ENGINE_BACKEND", "sglang")).strip().lower()
+        if backend == "sglang":
+            kwargs = {
                 "mem_fraction_static": cfg.SGLANG_MEM_FRAC,
                 "context_length": cfg.MAX_SEQ_LEN,
-            },
-        )
+            }
+            if getattr(cfg, "INFERENCE_QUANTIZATION", None):
+                kwargs["quantization"] = cfg.INFERENCE_QUANTIZATION
+            return SGLangOfflineEngine(cfg.MODEL_PATH, engine_kwargs=kwargs)
+        if backend == "vllm":
+            kwargs = {
+                "max_model_len": cfg.MAX_SEQ_LEN,
+                "gpu_memory_utilization": cfg.VLLM_GPU_MEMORY_UTILIZATION,
+            }
+            if getattr(cfg, "INFERENCE_QUANTIZATION", None):
+                kwargs["quantization"] = cfg.INFERENCE_QUANTIZATION
+            return VLLMOfflineEngine(
+                cfg.MODEL_PATH,
+                engine_kwargs=kwargs,
+                enable_lora=True,
+            )
+        raise ValueError(f"Unsupported OFFLINE_ENGINE_BACKEND: {backend}")
 
     def _init_inference_manager(self) -> None:
+        mode = "server" if (cfg.USE_SERVER_ENGINE or cfg.USE_TEACHER_PIPELINE) else f"offline:{cfg.OFFLINE_ENGINE_BACKEND}"
         self.engine_manager = EngineManager(
             engine=self._make_engine(),
             poll_interval=cfg.ENGINE_POLL_INTERVAL_S,
@@ -193,7 +212,7 @@ class Trainer:
         )
         self.engine_manager.start(checkpoint_path=None)
         self.engine_proxy = ManagedEngineProxy(self.engine_manager)
-        log.info("inference engine initialized (server=%s)", cfg.USE_SERVER_ENGINE or cfg.USE_TEACHER_PIPELINE)
+        log.info("inference engine initialized (%s)", mode)
 
     def _init_chunk_profiler(self) -> None:
         log.info("running ChunkSizeProfiler before training loop")
@@ -308,21 +327,63 @@ class Trainer:
         )
 
         if cfg.USE_TEACHER_PIPELINE:
+            teacher_server_url = cfg.TEACHER_SERVER_URL or cfg.SERVER_URL
+            teacher_model_name = cfg.TEACHER_SERVER_MODEL or cfg.SERVER_MODEL
             teacher_tools = get_tools(
                 docs_folder=cfg.TEACHER_DOCS_FOLDER,
                 embedding_model_url=cfg.TEACHER_EMBEDDING_URL,
             )
-            self.teacher_client = AgentClient(
-                engine=self.engine_proxy,
-                tokenizer=self.tokenizer,
-                system_prompt=cfg.TEACHER_SYSTEM_PROMPT,
-                tools=teacher_tools,
-                max_turns=10,
-                server_url=cfg.SERVER_URL,
-                model_name=cfg.SERVER_MODEL,
-            )
+            if self._is_openai_server_reachable(teacher_server_url):
+                self.teacher_client = AgentClient(
+                    engine=self.engine_proxy,
+                    tokenizer=self.tokenizer,
+                    system_prompt=cfg.TEACHER_SYSTEM_PROMPT,
+                    tools=teacher_tools,
+                    max_turns=10,
+                    server_url=teacher_server_url,
+                    model_name=teacher_model_name,
+                    default_max_completion_tokens=cfg.TEACHER_MAX_COMPLETION_TOKENS,
+                    default_reasoning_effort=cfg.TEACHER_REASONING_EFFORT,
+                )
+                log.info(
+                    "teacher client=agent endpoint=%s model=%s tools=%s max_completion=%s reasoning_effort=%s",
+                    teacher_server_url,
+                    teacher_model_name,
+                    [t.name for t in teacher_tools],
+                    cfg.TEACHER_MAX_COMPLETION_TOKENS,
+                    cfg.TEACHER_REASONING_EFFORT,
+                )
+            else:
+                self.teacher_client = SimpleTurnClient(
+                    engine=self.engine_proxy,
+                    tokenizer=self.tokenizer,
+                    system_prompt=cfg.TEACHER_SYSTEM_PROMPT,
+                    default_max_new_tokens=cfg.TEACHER_MAX_COMPLETION_TOKENS,
+                    default_temperature=cfg.TEMPERATURE,
+                    default_top_p=cfg.TOP_P,
+                    max_context_tokens=cfg.MAX_SEQ_LEN,
+                    context_safety_margin=cfg.CONTEXT_SAFETY_MARGIN,
+                )
+                log.warning(
+                    "teacher endpoint unreachable (%s). Falling back to SimpleTurnClient on rollout engine (max_new_tokens=%s).",
+                    teacher_server_url,
+                    cfg.TEACHER_MAX_COMPLETION_TOKENS,
+                )
         else:
             self.teacher_client = None
+
+    @staticmethod
+    def _is_openai_server_reachable(server_url: str) -> bool:
+        base = server_url.rstrip("/")
+        for path in ("/v1/models", "/health"):
+            try:
+                req = urllib.request.Request(f"{base}{path}", method="GET")
+                with urllib.request.urlopen(req, timeout=2.0) as resp:
+                    if 200 <= int(resp.status) < 500:
+                        return True
+            except Exception:
+                continue
+        return False
 
     def _init_pipeline(self) -> None:
         self.pipeline = SDPOTeacherPipeline(
@@ -456,6 +517,8 @@ class Trainer:
             return
         rl_mean_reward = step_result.rl_stats.get("mean_reward", 0.0)
         sft_pairs = step_result.sft_stats.get("n_pairs_saved", 0.0)
+        sft_hints = step_result.sft_stats.get("n_hints_given", 0.0)
+        sft_passed = step_result.sft_stats.get("n_passed_after_hint", 0.0)
         lr = 0.0
         if self.optimizer.param_groups:
             lr = float(self.optimizer.param_groups[0].get("lr", 0.0))
@@ -484,7 +547,8 @@ class Trainer:
             f"loss={loss_val:.4f} kl={kl_val:.4f} "
             f"tlogp={float(step_result.rl_stats.get('mean_teacher_logprob', 0.0)):.4f} "
             f"succ={float(step_result.rl_stats.get('success_ratio', 0.0)):.2f} "
-            f"grad_norm={grad_norm:.4f} lr={lr:.2e}"
+            f"grad_norm={grad_norm:.4f} lr={lr:.2e} "
+            f"hints={int(sft_hints)} pairs={int(sft_pairs)} passed_hint={int(sft_passed)}"
         )
 
     def train(self) -> None:
