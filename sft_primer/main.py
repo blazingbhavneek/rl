@@ -5,6 +5,7 @@ import json
 import math
 import os
 import random
+import shutil
 import signal
 import subprocess
 from pathlib import Path
@@ -17,9 +18,24 @@ from langchain_openai import ChatOpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel, Field
 
+# Global concurrency limit for all LLM requests.
 GLOBAL_LLM_SEMAPHORE = asyncio.Semaphore(50)
 
+# Structured output schema for question generation.
+class QuestionList(BaseModel):
+    questions: List[str] = Field(
+        description="チャンク内の情報だけで答えられる、あらゆる種類の質問リスト"
+    )
 
+
+# Structured output schema for answer generation.
+class AnswerItem(BaseModel):
+    answer: str = Field(
+        description="与えられたコンテキストのみに基づく回答。厳密な表現があれば優先して使う。"
+    )
+
+
+# Input markdown -> overlapped chunk JSON export.
 def process_input_folder_to_chunks(
     input_folder: str,
     input_root: str = "sft_primer/input",
@@ -56,6 +72,7 @@ def process_input_folder_to_chunks(
     return out_path
 
 
+# Start SGLang OpenAI-compatible server and return process PID.
 def start_sglang_openai_server(model_path: str, port: int) -> int:
     host = "0.0.0.0"
     cmd = [
@@ -81,6 +98,7 @@ def start_sglang_openai_server(model_path: str, port: int) -> int:
     return process.pid
 
 
+# Two-pass QA generation for one chunk with lookbehind context.
 async def generate_qa_for_chunk_with_lookbehind(
     chunks: List[str],
     chunk_index: int,
@@ -89,16 +107,6 @@ async def generate_qa_for_chunk_with_lookbehind(
     model_path: str,
     port: int,
 ) -> List[Dict[str, str]]:
-    class QuestionList(BaseModel):
-        questions: List[str] = Field(
-            description="チャンク内の情報だけで答えられる、あらゆる種類の質問リスト"
-        )
-
-    class AnswerItem(BaseModel):
-        answer: str = Field(
-            description="与えられたコンテキストのみに基づく回答。厳密な表現があれば優先して使う。"
-        )
-
     chunk_text = chunks[chunk_index]
     start_idx = max(0, chunk_index - max(0, lookbehind_chunks))
     context_parts = chunks[start_idx : chunk_index + 1]
@@ -143,23 +151,23 @@ async def generate_qa_for_chunk_with_lookbehind(
     questions = [q.strip() for q in q_obj.questions if q and q.strip()][
         : max(1, int(num_questions))
     ]
+    answer_prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "あなたはドキュメントQAアシスタントです。"
+                "回答は必ず与えられたコンテキストのみを根拠にしてください。"
+                "コンテキストに厳密な表現がある場合はその表現を優先して使ってください。",
+            ),
+            (
+                "human",
+                "コンテキスト:\n{context}\n\n質問:\n{question}\n\n"
+                "上のコンテキストだけを使って日本語で回答してください。",
+            ),
+        ]
+    )
 
     async def _answer_one(question: str) -> Dict[str, str]:
-        answer_prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    "あなたはドキュメントQAアシスタントです。"
-                    "回答は必ず与えられたコンテキストのみを根拠にしてください。"
-                    "コンテキストに厳密な表現がある場合はその表現を優先して使ってください。",
-                ),
-                (
-                    "human",
-                    "コンテキスト:\n{context}\n\n質問:\n{question}\n\n"
-                    "上のコンテキストだけを使って日本語で回答してください。",
-                ),
-            ]
-        )
         a_messages = answer_prompt.format_messages(
             context=context_text, question=question
         )
@@ -171,6 +179,7 @@ async def generate_qa_for_chunk_with_lookbehind(
     return await asyncio.gather(*[_answer_one(q) for q in questions])
 
 
+# Train LoRA adapters from QA pairs using StreamingBackprop + ChunkSizeProfiler.
 def train_model_on_qa_pairs(
     qa_pairs: List[Dict[str, str]],
     train_model_path: str,
@@ -196,6 +205,14 @@ def train_model_on_qa_pairs(
 
     if lora_target is None:
         lora_target = ["q_proj", "k_proj", "v_proj", "o_proj"]
+    model_key = train_model_path.strip("/").replace("\\", "_").replace("/", "_").replace(":", "_")
+    output_root = Path(output_dir)
+    lora_model_dir = output_root / "lora" / model_key
+    ckpt_dir = output_root / "checkpoint" / model_key
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    progress_path = ckpt_dir / "train_state.json"
+    optim_state_path = ckpt_dir / "optim_state.pt"
+    latest_adapter_dir = ckpt_dir / "latest_adapter"
 
     rng = random.Random(int(seed))
     rows = list(qa_pairs)
@@ -284,7 +301,30 @@ def train_model_on_qa_pairs(
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     step_count = 0
-    for epoch in range(1, int(epochs) + 1):
+    start_epoch = 1
+    if progress_path.exists():
+        progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        last_epoch = int(progress.get("last_completed_epoch", 0))
+        start_epoch = last_epoch + 1
+        step_count = int(progress.get("optimizer_steps", 0))
+        if latest_adapter_dir.exists():
+            backprop.load_lora(str(latest_adapter_dir))
+        if optim_state_path.exists():
+            try:
+                st = torch.load(optim_state_path, map_location="cpu")
+                if "optimizer" in st:
+                    optimizer.load_state_dict(st["optimizer"])
+                if "scheduler" in st:
+                    scheduler.load_state_dict(st["scheduler"])
+            except Exception:
+                pass
+
+    if start_epoch > int(epochs):
+        final_dir = lora_model_dir / "final"
+        final_dir.mkdir(parents=True, exist_ok=True)
+        return str(final_dir)
+
+    for epoch in range(start_epoch, int(epochs) + 1):
         rng.shuffle(rows)
         optimizer.zero_grad(set_to_none=True)
         running_loss = 0.0
@@ -345,62 +385,102 @@ def train_model_on_qa_pairs(
 
         mean_loss = running_loss / max(1, len(rows))
         print(f"[sft_primer] epoch={epoch} mean_loss={mean_loss:.4f} optimizer_steps={step_count}", flush=True)
+        epoch_dir = lora_model_dir / f"epoch_{epoch}"
+        epoch_dir.mkdir(parents=True, exist_ok=True)
+        backprop.save_lora(str(epoch_dir))
+        if latest_adapter_dir.exists():
+            shutil.rmtree(latest_adapter_dir)
+        latest_adapter_dir.mkdir(parents=True, exist_ok=True)
+        backprop.save_lora(str(latest_adapter_dir))
+        torch.save(
+            {"optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict()},
+            optim_state_path,
+        )
+        progress_path.write_text(
+            json.dumps(
+                {
+                    "model_key": model_key,
+                    "last_completed_epoch": int(epoch),
+                    "total_epochs": int(epochs),
+                    "optimizer_steps": int(step_count),
+                    "latest_adapter_dir": str(latest_adapter_dir),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 
-    final_dir = Path(output_dir) / "lora" / "final"
+    final_dir = lora_model_dir / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
     backprop.save_lora(str(final_dir))
     return str(final_dir)
 
 
+# Minimal end-to-end pipeline: chunk -> QA generate/resume -> train/resume.
 def main() -> None:
+    # User-editable runtime config.
     INPUT_FOLDER = "mylib"
     QA_MODEL_PATH = "openai/gpt-oss-20b"
     QA_PORT = 30000
     LOOKBEHIND_CHUNKS = 2
     NUM_QUESTIONS_PER_CHUNK = 20
     TRAIN_MODEL_PATH = "openai/gpt-oss-20b"
-    TRAIN_OUTPUT_DIR = "sft_primer/output/mylib_train"
 
-    chunks_path = process_input_folder_to_chunks(INPUT_FOLDER)
+    # Output paths and chunking checkpoint.
     output_dir = Path("sft_primer/output") / INPUT_FOLDER
+    output_dir.mkdir(parents=True, exist_ok=True)
+    chunks_path = output_dir / "chunks.json"
     qa_pairs_path = output_dir / "qa_pair.json"
 
-    chunk_rows = json.loads(chunks_path.read_text(encoding="utf-8"))
-    chunks = [str(row.get("text", "")) for row in chunk_rows if str(row.get("text", "")).strip()]
-
-    server_pid = start_sglang_openai_server(QA_MODEL_PATH, QA_PORT)
+    # QA dataset checkpoint load/generate.
     qa_pairs: List[Dict[str, str]] = []
+    if qa_pairs_path.exists() and qa_pairs_path.stat().st_size > 0:
+        with qa_pairs_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                qa_pairs.append(json.loads(line))
+    else:
+        if not chunks_path.exists():
+            chunks_path = process_input_folder_to_chunks(INPUT_FOLDER)
+        chunk_rows = json.loads(chunks_path.read_text(encoding="utf-8"))
+        chunks = [str(row.get("text", "")) for row in chunk_rows if str(row.get("text", "")).strip()]
+        server_pid = start_sglang_openai_server(QA_MODEL_PATH, QA_PORT)
 
-    async def run_all_chunks() -> None:
-        tasks = [
-            generate_qa_for_chunk_with_lookbehind(
-                chunks,
-                i,
-                LOOKBEHIND_CHUNKS,
-                NUM_QUESTIONS_PER_CHUNK,
-                QA_MODEL_PATH,
-                QA_PORT,
-            )
-            for i in range(len(chunks))
-        ]
-        qa_pairs_path.parent.mkdir(parents=True, exist_ok=True)
-        with qa_pairs_path.open("a", encoding="utf-8") as f:
-            for fut in asyncio.as_completed(tasks):
-                chunk_pairs = await fut
-                qa_pairs.extend(chunk_pairs)
-                for pair in chunk_pairs:
-                    f.write(json.dumps(pair, ensure_ascii=False) + "\n")
-                f.flush()
+        # Generate QA for all chunks concurrently (bounded by global semaphore).
+        async def run_all_chunks() -> None:
+            tasks = [
+                generate_qa_for_chunk_with_lookbehind(
+                    chunks,
+                    i,
+                    LOOKBEHIND_CHUNKS,
+                    NUM_QUESTIONS_PER_CHUNK,
+                    QA_MODEL_PATH,
+                    QA_PORT,
+                )
+                for i in range(len(chunks))
+            ]
+            qa_pairs_path.parent.mkdir(parents=True, exist_ok=True)
+            with qa_pairs_path.open("a", encoding="utf-8") as f:
+                for fut in asyncio.as_completed(tasks):
+                    chunk_pairs = await fut
+                    qa_pairs.extend(chunk_pairs)
+                    for pair in chunk_pairs:
+                        f.write(json.dumps(pair, ensure_ascii=False) + "\n")
+                    f.flush()
 
-    try:
-        asyncio.run(run_all_chunks())
-    finally:
+        # Always stop SGLang after generation phase.
         try:
-            os.kill(server_pid, signal.SIGTERM)
-        except OSError:
-            pass
+            asyncio.run(run_all_chunks())
+        finally:
+            try:
+                os.kill(server_pid, signal.SIGTERM)
+            except OSError:
+                pass
 
-    train_model_on_qa_pairs(qa_pairs, TRAIN_MODEL_PATH, TRAIN_OUTPUT_DIR)
+    # Train or resume training on generated QA pairs.
+    train_model_on_qa_pairs(qa_pairs, TRAIN_MODEL_PATH, str(output_dir))
 
 
 if __name__ == "__main__":
