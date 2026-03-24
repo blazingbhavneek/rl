@@ -8,8 +8,11 @@ import random
 import shutil
 import signal
 import subprocess
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from backprop import BackpropConfig, ChunkSizeProfiler, StreamingBackprop
@@ -17,6 +20,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel, Field
+from tqdm import tqdm
 
 # Global concurrency limit for all LLM requests.
 GLOBAL_LLM_SEMAPHORE = asyncio.Semaphore(50)
@@ -72,8 +76,13 @@ def process_input_folder_to_chunks(
     return out_path
 
 
-# Start SGLang OpenAI-compatible server and return process PID.
-def start_sglang_openai_server(model_path: str, port: int) -> int:
+# Start SGLang OpenAI-compatible server and return process PID + log path.
+def start_sglang_openai_server(
+    model_path: str,
+    port: int,
+    log_dir: Optional[str] = None,
+    attention_backend: str = "triton",
+) -> Tuple[int, str]:
     host = "0.0.0.0"
     cmd = [
         "python",
@@ -85,17 +94,91 @@ def start_sglang_openai_server(model_path: str, port: int) -> int:
         host,
         "--port",
         str(port),
+        "--attention-backend",
+        str(attention_backend),
     ]
 
     env = os.environ.copy()
+    logs_root = Path(log_dir) if log_dir else Path("sft_primer/output/logs")
+    logs_root.mkdir(parents=True, exist_ok=True)
+    log_path = logs_root / f"sglang_port_{int(port)}.log"
+    log_fp = open(log_path, "w", encoding="utf-8")
     process = subprocess.Popen(
         cmd,
         env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=log_fp,
+        stderr=subprocess.STDOUT,
         text=True,
     )
-    return process.pid
+    wait_for_sglang_server_ready(
+        process=process,
+        port=port,
+        timeout_s=300,
+        log_path=str(log_path),
+    )
+    print(f"[sft_primer] SGLang logs: {log_path}", flush=True)
+    return process.pid, str(log_path)
+
+
+def wait_for_sglang_server_ready(
+    process: subprocess.Popen,
+    port: int,
+    timeout_s: int = 300,
+    poll_interval_s: float = 1.0,
+    log_path: Optional[str] = None,
+) -> None:
+    """Block until local SGLang OpenAI endpoint responds or timeout is hit."""
+    deadline = time.time() + max(1, int(timeout_s))
+    url = f"http://127.0.0.1:{int(port)}/v1/models"
+    last_error: str = "unknown"
+
+    while time.time() < deadline:
+        # If process died early, surface that immediately.
+        rc = process.poll()
+        if rc is not None:
+            log_tail = _tail_log_file(log_path, lines=120)
+            raise RuntimeError(
+                f"SGLang server exited before becoming ready (exit_code={rc}).\n"
+                f"log_path={log_path}\n"
+                f"--- SGLang log tail ---\n{log_tail}"
+            )
+
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                if int(resp.status) == 200:
+                    print(f"[sft_primer] SGLang is ready at {url}", flush=True)
+                    return
+                last_error = f"http_status={resp.status}"
+        except urllib.error.URLError as exc:
+            last_error = str(exc)
+        except Exception as exc:
+            last_error = str(exc)
+
+        print("[sft_primer] waiting for SGLang server to become ready...", flush=True)
+        time.sleep(max(0.2, float(poll_interval_s)))
+
+    raise TimeoutError(
+        f"SGLang server did not become ready within {timeout_s}s at {url}. "
+        f"Last error: {last_error}\n"
+        f"log_path={log_path}\n"
+        f"--- SGLang log tail ---\n{_tail_log_file(log_path, lines=120)}"
+    )
+
+
+def _tail_log_file(log_path: Optional[str], lines: int = 120) -> str:
+    if not log_path:
+        return "(no log path)"
+    path = Path(log_path)
+    if not path.exists():
+        return f"(log file missing: {path})"
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        rows = text.splitlines()
+        tail = rows[-max(1, int(lines)) :]
+        return "\n".join(tail) if tail else "(log file is empty)"
+    except Exception as exc:
+        return f"(failed reading log file: {exc})"
 
 
 # Two-pass QA generation for one chunk with lookbehind context.
@@ -184,10 +267,10 @@ def train_model_on_qa_pairs(
     qa_pairs: List[Dict[str, str]],
     train_model_path: str,
     output_dir: str,
-    epochs: int = 3,
+    epochs: int = 1,
     lr: float = 2e-4,
     weight_decay: float = 0.01,
-    grad_accum_steps: int = 8,
+    grad_accum_steps: int = 1,
     max_grad_norm: float = 1.0,
     lora_rank: int = 128,
     lora_alpha: int = 256,
@@ -195,6 +278,8 @@ def train_model_on_qa_pairs(
     lora_target: List[str] = None,
     lora_layers_frac: float = 0.25,
     seed: int = 42,
+    train_batch_size: int = 8,
+    profiler_sglang_mem_frac: float = 0.0,
 ) -> str:
     from peft import LoraConfig, TaskType, get_peft_model
     from torch.optim import AdamW
@@ -246,7 +331,6 @@ def train_model_on_qa_pairs(
     bp_cfg = BackpropConfig(
         top_frac=float(lora_layers_frac),
         use_grad_checkpoint=True,
-        offload_prefix_cpu=True,
     )
     backprop = StreamingBackprop(model, config=bp_cfg)
 
@@ -256,17 +340,51 @@ def train_model_on_qa_pairs(
     hidden_size = int(getattr(model_cfg, "hidden_size"))
     vocab_size = int(getattr(model_cfg, "vocab_size"))
     profile_dir = str(Path(output_dir) / "chunk_profiles")
+
+    # Convert QA rows into tokenized SFT samples once.
+    train_samples: List[Dict[str, List[int]]] = []
     max_completion_len = 1
     for row in rows:
         if "messages" in row and isinstance(row["messages"], list) and len(row["messages"]) >= 2:
+            prompt_messages = row["messages"][:-1]
             answer_text = row["messages"][-1].get("content", "")
         else:
+            q = str(row.get("question", "")).strip()
+            prompt_messages = [{"role": "user", "content": q}]
             answer_text = str(row.get("answer", "")).strip()
-        if not answer_text:
+        if not answer_text.strip():
             continue
-        ln = len(tokenizer.encode(answer_text, add_special_tokens=False))
-        if ln > max_completion_len:
-            max_completion_len = ln
+        if hasattr(tokenizer, "apply_chat_template"):
+            prompt_text = tokenizer.apply_chat_template(
+                prompt_messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        else:
+            prompt_text = "\n".join([m.get("content", "") for m in prompt_messages]) + "\nAssistant:"
+
+        prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+        completion_ids = tokenizer.encode(answer_text, add_special_tokens=False)
+        if not prompt_ids or not completion_ids:
+            continue
+
+        train_samples.append(
+            {
+                "prompt_ids": prompt_ids,
+                "completion_ids": completion_ids,
+            }
+        )
+        max_completion_len = max(max_completion_len, len(completion_ids))
+
+    if not train_samples:
+        raise ValueError("No valid training samples after tokenization.")
+
+    # Profile output lengths up to 16k as requested.
+    max_profile_output_len = 16_000
+    profiled_completion_len = min(int(max_completion_len), max_profile_output_len)
+    # Batch sweep starts at 256 and decreases by /2.
+    profile_batch_candidates = [256, 128, 64, 32, 16, 8, 4, 2, 1]
+    profile_seq_buckets = [2000, 4000, 8000, 16000]
 
     profiler = ChunkSizeProfiler(
         lm_head=lm_head,
@@ -274,14 +392,33 @@ def train_model_on_qa_pairs(
         vocab_size=vocab_size,
         device=device,
         model_path=train_model_path,
-        sglang_mem_frac=0.0,
+        sglang_mem_frac=float(profiler_sglang_mem_frac),
         top_frac=float(lora_layers_frac),
         cache_dir=profile_dir,
         dtype=dtype,
+        batch_candidates=profile_batch_candidates,
+        max_chunk_cap=32000,
+        vram_safety_ratio=0.95,
+    )
+    profiler.SEQ_BUCKETS = list(profile_seq_buckets)
+    print(
+        f"[sft_primer] profiling chunk grid: seq_buckets={profile_seq_buckets} "
+        f"batch_candidates={profile_batch_candidates} "
+        f"max_profile_output_len={max_profile_output_len} "
+        f"sglang_mem_frac={float(profiler_sglang_mem_frac):.3f}",
+        flush=True,
     )
     profiler.load_or_profile()
     backprop.chunk_profiler = profiler
-    backprop.config.logit_chunk = profiler.get_chunk_size(int(max_completion_len))
+    backprop.config.logit_chunk = profiler.get_chunk_size(
+        int(profiled_completion_len),
+        batch_size=min(int(train_batch_size), 256),
+    )
+    print(
+        f"[sft_primer] initial chunk choice={backprop.config.logit_chunk} "
+        f"(seq_len={profiled_completion_len}, batch={min(int(train_batch_size), 256)})",
+        flush=True,
+    )
 
     optimizer = AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -289,7 +426,11 @@ def train_model_on_qa_pairs(
         weight_decay=float(weight_decay),
     )
 
-    total_updates = max(1, math.ceil((len(rows) * int(epochs)) / max(1, int(grad_accum_steps))))
+    num_samples = len(train_samples)
+    train_batch_size = max(1, int(train_batch_size))
+    grad_accum_steps = max(1, int(grad_accum_steps))
+    num_micro_batches = max(1, math.ceil(num_samples / train_batch_size))
+    total_updates = max(1, math.ceil((num_micro_batches * int(epochs)) / grad_accum_steps))
 
     def lr_lambda(step: int) -> float:
         warmup = max(1, int(0.05 * total_updates))
@@ -322,69 +463,87 @@ def train_model_on_qa_pairs(
     if start_epoch > int(epochs):
         final_dir = lora_model_dir / "final"
         final_dir.mkdir(parents=True, exist_ok=True)
+        backprop.save_lora(str(final_dir))
         return str(final_dir)
 
     for epoch in range(start_epoch, int(epochs) + 1):
-        rng.shuffle(rows)
+        rng.shuffle(train_samples)
         optimizer.zero_grad(set_to_none=True)
         running_loss = 0.0
+        seen_batches = 0
 
-        for i, row in enumerate(rows):
-            if "messages" in row and isinstance(row["messages"], list) and len(row["messages"]) >= 2:
-                prompt_messages = row["messages"][:-1]
-                answer_text = row["messages"][-1].get("content", "")
-            else:
-                q = str(row.get("question", "")).strip()
-                a = str(row.get("answer", "")).strip()
-                prompt_messages = [{"role": "user", "content": q}]
-                answer_text = a
-
-            if not answer_text.strip():
+        for batch_start in range(0, len(train_samples), train_batch_size):
+            batch_rows = train_samples[batch_start : batch_start + train_batch_size]
+            batch_size = len(batch_rows)
+            if batch_size == 0:
                 continue
 
-            if hasattr(tokenizer, "apply_chat_template"):
-                prompt_text = tokenizer.apply_chat_template(
-                    prompt_messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-            else:
-                prompt_text = "\n".join([m.get("content", "") for m in prompt_messages]) + "\nAssistant:"
+            # Build padded prompt/completion tensors for one SFT batch.
+            max_prompt_len = max(len(x["prompt_ids"]) for x in batch_rows)
+            max_comp_len = max(len(x["completion_ids"]) for x in batch_rows)
 
-            prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
-            completion_ids_1d = tokenizer.encode(answer_text, add_special_tokens=False)
-            if not completion_ids_1d:
-                continue
+            prompt_tensor = torch.full(
+                (batch_size, max_prompt_len),
+                fill_value=int(tokenizer.pad_token_id),
+                dtype=torch.long,
+                device=device,
+            )
+            completion_tensor = torch.zeros(
+                (batch_size, max_comp_len),
+                dtype=torch.long,
+                device=device,
+            )
+            completion_mask = torch.zeros(
+                (batch_size, max_comp_len),
+                dtype=torch.float32,
+                device=device,
+            )
+            for row_idx, sample in enumerate(batch_rows):
+                p_ids = sample["prompt_ids"]
+                c_ids = sample["completion_ids"]
+                prompt_tensor[row_idx, : len(p_ids)] = torch.tensor(p_ids, dtype=torch.long, device=device)
+                completion_tensor[row_idx, : len(c_ids)] = torch.tensor(c_ids, dtype=torch.long, device=device)
+                completion_mask[row_idx, : len(c_ids)] = 1.0
 
-            prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-            completion_tensor = torch.tensor([completion_ids_1d], dtype=torch.long, device=device)
-            completion_mask = torch.ones_like(completion_tensor, dtype=torch.float32, device=device)
+            # Keep a good fallback chunk for this exact batch/length.
+            backprop.config.logit_chunk = profiler.get_chunk_size(
+                int(max_comp_len),
+                batch_size=int(batch_size),
+            )
 
-            def sft_loss_fn(log_probs, gen_idx: int, hidden_comp=None):
-                del hidden_comp
-                mask = completion_mask[gen_idx].to(log_probs.device, non_blocking=True)
-                return -(log_probs * mask).sum() / mask.sum().clamp(min=1.0)
+            def loss_fn_batch(batch_log_probs, batch_mask, hidden_batch=None):
+                del hidden_batch
+                denom = batch_mask.sum().clamp(min=1.0)
+                return -((batch_log_probs * batch_mask).sum() / denom)
 
             stats = backprop.backward_on_batch(
                 model=model,
                 prompt_ids=prompt_tensor,
                 completion_ids=completion_tensor,
                 completion_mask=completion_mask,
-                loss_fn=sft_loss_fn,
-                loss_scale=1.0 / max(1, int(grad_accum_steps)),
+                loss_fn=loss_fn_batch,
+                loss_scale=1.0 / float(grad_accum_steps),
                 lora_path=None,
             )
             running_loss += float(stats.get("loss", 0.0))
+            seen_batches += 1
 
-            if ((i + 1) % max(1, int(grad_accum_steps)) == 0) or (i + 1 == len(rows)):
+            if (seen_batches % grad_accum_steps == 0) or (batch_start + train_batch_size >= len(train_samples)):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(max_grad_norm))
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 step_count += 1
 
-        mean_loss = running_loss / max(1, len(rows))
-        print(f"[sft_primer] epoch={epoch} mean_loss={mean_loss:.4f} optimizer_steps={step_count}", flush=True)
+        mean_loss = running_loss / max(1, seen_batches)
+        print(
+            f"[sft_primer] epoch={epoch} "
+            f"mean_batch_loss={mean_loss:.4f} "
+            f"optimizer_steps={step_count} "
+            f"batches={seen_batches} "
+            f"samples={len(train_samples)}",
+            flush=True,
+        )
         epoch_dir = lora_model_dir / f"epoch_{epoch}"
         epoch_dir.mkdir(parents=True, exist_ok=True)
         backprop.save_lora(str(epoch_dir))
@@ -419,12 +578,13 @@ def train_model_on_qa_pairs(
 # Minimal end-to-end pipeline: chunk -> QA generate/resume -> train/resume.
 def main() -> None:
     # User-editable runtime config.
-    INPUT_FOLDER = "mylib"
-    QA_MODEL_PATH = "openai/gpt-oss-20b"
+    INPUT_FOLDER = "intel"
+    QA_MODEL_PATH = "/media/blazingbhavneek/Common/Code/sglangServer/Infer/Qwen/Qwen3.5-0.8B"
     QA_PORT = 30000
+    QA_ATTENTION_BACKEND = "triton"
     LOOKBEHIND_CHUNKS = 2
-    NUM_QUESTIONS_PER_CHUNK = 20
-    TRAIN_MODEL_PATH = "openai/gpt-oss-20b"
+    NUM_QUESTIONS_PER_CHUNK = 5
+    TRAIN_MODEL_PATH = "/media/blazingbhavneek/Common/Code/sglangServer/Infer/Qwen/Qwen3.5-0.8B"
 
     # Output paths and chunking checkpoint.
     output_dir = Path("sft_primer/output") / INPUT_FOLDER
@@ -446,7 +606,12 @@ def main() -> None:
             chunks_path = process_input_folder_to_chunks(INPUT_FOLDER)
         chunk_rows = json.loads(chunks_path.read_text(encoding="utf-8"))
         chunks = [str(row.get("text", "")) for row in chunk_rows if str(row.get("text", "")).strip()]
-        server_pid = start_sglang_openai_server(QA_MODEL_PATH, QA_PORT)
+        server_pid, server_log_path = start_sglang_openai_server(
+            QA_MODEL_PATH,
+            QA_PORT,
+            attention_backend=QA_ATTENTION_BACKEND,
+        )
+        print(f"[sft_primer] server_pid={server_pid} log_path={server_log_path}", flush=True)
 
         # Generate QA for all chunks concurrently (bounded by global semaphore).
         async def run_all_chunks() -> None:
@@ -461,9 +626,15 @@ def main() -> None:
                 )
                 for i in range(len(chunks))
             ]
+            print(f"[sft_primer] QA generation chunks total={len(tasks)}", flush=True)
             qa_pairs_path.parent.mkdir(parents=True, exist_ok=True)
             with qa_pairs_path.open("a", encoding="utf-8") as f:
-                for fut in asyncio.as_completed(tasks):
+                for fut in tqdm(
+                    asyncio.as_completed(tasks),
+                    total=len(tasks),
+                    desc="qa_chunks",
+                    unit="chunk",
+                ):
                     chunk_pairs = await fut
                     qa_pairs.extend(chunk_pairs)
                     for pair in chunk_pairs:

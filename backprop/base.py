@@ -19,10 +19,9 @@ except Exception:  # pragma: no cover - optional dependency at runtime
 @dataclass
 class BackpropConfig:
     top_frac: float = 0.25
-    query_chunk: int = 4096
     logit_chunk: int = 64
     use_grad_checkpoint: bool = True
-    offload_prefix_cpu: bool = True
+    use_torch_compile: bool = False
 
 
 class BaseBackprop(ABC):

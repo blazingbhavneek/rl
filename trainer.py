@@ -171,10 +171,10 @@ class Trainer:
         self.backprop = StreamingBackprop(self.model, config=bp_cfg)
         setattr(self.backprop, "enable_tqdm", True)
         log.info(
-            "backprop=streaming top_frac=%.3f grad_ckpt=%s offload_prefix_cpu=%s",
+            "backprop=streaming top_frac=%.3f grad_ckpt=%s torch_compile=%s",
             bp_cfg.top_frac,
             bp_cfg.use_grad_checkpoint,
-            bp_cfg.offload_prefix_cpu,
+            bp_cfg.use_torch_compile,
         )
 
     def _make_engine(self) -> BaseEngine:
@@ -234,6 +234,9 @@ class Trainer:
             top_frac=cfg.LORA_LAYERS_FRAC,
             cache_dir=cfg.CHUNK_PROFILE_DIR,
             dtype=self._dtype(),
+            batch_candidates=list(cfg.CHUNK_PROFILE_BATCH_CANDIDATES),
+            max_chunk_cap=int(cfg.CHUNK_PROFILE_MAX_CHUNK_CAP),
+            vram_safety_ratio=float(cfg.CHUNK_PROFILE_VRAM_MAX_RATIO),
         )
         if cfg.FORCE_REPROFILE:
             self.profiler.invalidate()

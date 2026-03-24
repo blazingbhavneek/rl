@@ -121,13 +121,16 @@ LOG_STEPS = 1
 # Chunk profiler cache path and force-refresh switch.
 CHUNK_PROFILE_DIR = f"{OUTPUT_DIR}/chunk_profiles"
 FORCE_REPROFILE = False
+CHUNK_PROFILE_BATCH_CANDIDATES = [32, 16, 8, 4, 2, 1]
+CHUNK_PROFILE_MAX_CHUNK_CAP = 32000
+CHUNK_PROFILE_VRAM_MAX_RATIO = 0.95
 
 
 def build_backprop_config() -> BackpropConfig:
     return BackpropConfig(
         top_frac=LORA_LAYERS_FRAC,
         use_grad_checkpoint=True,
-        offload_prefix_cpu=True,
+        use_torch_compile=True,
     )
 
 
