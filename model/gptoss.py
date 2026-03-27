@@ -136,10 +136,15 @@ class GptOssModel(BaseModel):
             hidden_states: torch.Tensor,
             full_attention_mask: torch.Tensor,
             sliding_attention_mask: torch.Tensor,
+            position_ids: torch.Tensor,
             position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         ) -> torch.Tensor:
-            for i, layer in enumerate(self._prefix_layers):
-                layer_type = self._prefix_layer_types.get(i, "full_attention")
+            layer_types = list(getattr(self._inner_model.config, "layer_types", []))
+            for i in range(self._prefix_split_layer):
+                layer = self._inner_model.layers[i]
+                layer_type = (
+                    layer_types[i] if i < len(layer_types) else "full_attention"
+                )
                 layer_mask = (
                     sliding_attention_mask
                     if layer_type == "sliding_attention"
@@ -148,21 +153,21 @@ class GptOssModel(BaseModel):
                 out = layer(
                     hidden_states,
                     attention_mask=layer_mask,
+                    position_ids=position_ids,
+                    past_key_values=None,
+                    use_cache=False,
                     position_embeddings=position_embeddings,
                 )
                 hidden_states = out[0] if isinstance(out, tuple) else out
             return hidden_states
 
-        # Compile path is intentionally disabled for now.
-        # Why: this graph hit reproducible torch.compile/inductor failures in local runs.
-        # if hasattr(torch, "compile"):
-        #     try:
-        #         self._compiled_prefix_fn = torch.compile(_prefix_body, dynamic=True)
-        #     except Exception:
-        #         self._compiled_prefix_fn = _prefix_body
-        # else:
-        #     self._compiled_prefix_fn = _prefix_body
-        self._compiled_prefix_fn = _prefix_body
+        self._prefix_body_eager = _prefix_body
+
+        # Try compile first for lower Python overhead; fall back to eager if unsupported.
+        try:
+            self._compiled_prefix_fn = torch.compile(_prefix_body, dynamic=False)
+        except Exception:
+            self._compiled_prefix_fn = _prefix_body
 
         # endregion
 
@@ -274,32 +279,16 @@ class GptOssModel(BaseModel):
         - Position ids use int64: B * T * 8 bytes (~1.01 MiB), typically negligible vs hidden.
         """
         
-        # Input is expected as token ids with shape [batch, seq_len].
-        batch_size = input_ids.shape[0]
-        seq_len = input_ids.shape[1]
-
-        # Build position ids explicitly.
-        # Why: in this split/manual forward path we do not call the monolithic HF model.forward,
-        # so we must provide the RoPE lookup positions ourselves.
-        position_ids = (
-            torch.arange(seq_len, dtype=torch.long)
-            .unsqueeze(0)
-            .expand(batch_size, seq_len)
-            .to(input_ids)
-        )
-
-        # Token embedding lookup to get hidden states [batch, seq_len, hidden_size].
+        # 1) Build inputs_embeds from embed_tokens.
         hidden_states = self._inner_model.embed_tokens(input_ids)
 
-        # Model config gives us head_dim needed by rotary embedding module.
-        cfg = self._inner_model.config
-        head_dim = getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)
-
-        # Dummy tensor is used only to satisfy rotary_emb API shape contract.
-        dummy = hidden_states.new_zeros(1, seq_len, head_dim)
-
-        # Precompute rotary cos/sin once for the full prefix pass.
-        position_embeddings = self._inner_model.rotary_emb(dummy, position_ids)
+        # 2) Build position_ids if missing.
+        batch_size, seq_len = input_ids.shape
+        position_ids = (
+            torch.arange(seq_len, device=input_ids.device, dtype=torch.long)
+            .unsqueeze(0)
+            .expand(batch_size, seq_len)
+        )
 
         # Match HF GPT-OSS masking contract for per-layer attention type selection.
         # Why: full/sliding layer masks must match HF exactly for boundary/logit parity.
@@ -314,13 +303,29 @@ class GptOssModel(BaseModel):
         full_attention_mask = create_causal_mask(**mask_kwargs)
         sliding_attention_mask = create_sliding_window_causal_mask(**mask_kwargs)
 
+        # 4) Compute RoPE once from embeddings + position_ids.
+        position_embeddings = self._inner_model.rotary_emb(hidden_states, position_ids)
+
         # Run the preselected prefix-layer subset through compiled prefix function.
-        hidden_states = self._compiled_prefix_fn(
-            hidden_states,
-            full_attention_mask,
-            sliding_attention_mask,
-            position_embeddings,
-        )
+        try:
+            hidden_states = self._compiled_prefix_fn(
+                hidden_states,
+                full_attention_mask,
+                sliding_attention_mask,
+                position_ids,
+                position_embeddings,
+            )
+        except Exception:
+            # Compile can fail at first invocation (not only at torch.compile wrap-time).
+            # Fallback to eager permanently for this model instance.
+            self._compiled_prefix_fn = self._prefix_body_eager
+            hidden_states = self._compiled_prefix_fn(
+                hidden_states,
+                full_attention_mask,
+                sliding_attention_mask,
+                position_ids,
+                position_embeddings,
+            )
 
         # Return raw prefix outputs; boundary grad handoff is managed by BaseModel.forward.
         return hidden_states, position_ids
