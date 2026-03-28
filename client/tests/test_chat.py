@@ -63,10 +63,15 @@ async def _run() -> None:
         print(f"output: {repr(output_text)}")
 
         print("\n[3] Structured Pydantic run")
+        structured_prompt = (
+            "Solve this carefully: A bat and a ball cost $1.10 total. "
+            "The bat costs $1.00 more than the ball. "
+            "Think step by step first, then return JSON with key 'answer' only and value as a short string "
+            "(example: '$0.05')."
+        )
+
         reasoning_model, output_model = await client.run(
-            "Solve carefully: If 3 workers finish a job in 6 days at the same rate, "
-            "how many days would 2 workers take? Think first. "
-            "Return JSON with key 'answer' only and value as a short string (example: '9 days').",
+            structured_prompt,
             output_model=ShortAnswer,
         )
         print(f"reasoning: {repr(reasoning_model)}")

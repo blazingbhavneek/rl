@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from typing import Optional, Type
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
@@ -20,26 +19,32 @@ class ChatClient(BaseClient):
         base_url: str,
         api_key: str,
         temperature: float,
-        max_output_tokens: int,
+        max_output_tokens: Optional[int],
         system_prompt: str,
         model: str,
     ) -> None:
         self.model = model
         self.temperature = float(temperature)
-        self.max_output_tokens = int(max_output_tokens)
+        self.max_output_tokens = (
+            int(max_output_tokens)
+            if max_output_tokens is not None and int(max_output_tokens) > 0
+            else None
+        )
         self.system_prompt = system_prompt
-        self.llm = ChatOpenAI(
-            model=model,
-            api_key=api_key,
-            base_url=base_url,
-            temperature=self.temperature,
-            max_tokens=self.max_output_tokens,
-            extra_body={
+        llm_kwargs: dict[str, object] = {
+            "model": model,
+            "api_key": api_key,
+            "base_url": base_url,
+            "temperature": self.temperature,
+            "extra_body": {
                 "chat_template_kwargs": {
                     "enable_thinking": True,
                 }
             },
-        )
+        }
+        if self.max_output_tokens is not None:
+            llm_kwargs["max_tokens"] = self.max_output_tokens
+        self.llm = ChatOpenAI(**llm_kwargs)
         self.message_history: list[BaseMessage] = [SystemMessage(content=system_prompt)]
 
     def reset_history(self, system_prompt: Optional[str] = None) -> None:
@@ -53,46 +58,59 @@ class ChatClient(BaseClient):
 
         return [*self.message_history, HumanMessage(content=prompt)]
 
-    def _extract_reasoning(self, message: AIMessage) -> str:
-        def _normalize(value: object) -> str:
-            if isinstance(value, str):
-                return value.strip()
-            if isinstance(value, list):
-                parts: list[str] = []
-                for item in value:
-                    if isinstance(item, str):
-                        txt = item.strip()
-                        if txt:
-                            parts.append(txt)
-                    elif isinstance(item, dict):
-                        for k in ("reasoning", "reasoning_content", "text", "content"):
-                            v = item.get(k)
-                            if isinstance(v, str) and v.strip():
-                                parts.append(v.strip())
-                return "\n".join(parts).strip()
-            if isinstance(value, dict):
-                for k in ("reasoning", "reasoning_content", "text", "content"):
-                    v = value.get(k)
-                    if isinstance(v, str) and v.strip():
-                        return v.strip()
+    def _extract_reasoning(self, message: object) -> str:
+        if message is None:
             return ""
 
-        for payload in (message.additional_kwargs, message.response_metadata):
-            if isinstance(payload, dict):
-                for key in ("reasoning", "reasoning_content"):
-                    txt = _normalize(payload.get(key))
-                    if txt:
-                        return txt
+        def _from_dict(d: object) -> str:
+            if not isinstance(d, dict):
+                return ""
+            val = d.get("reasoning") or d.get("reasoning_content")
+            return val.strip() if isinstance(val, str) else ""
 
+        for key in ("reasoning", "reasoning_content"):
+            val = getattr(message, key, None)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        for payload in (
+            getattr(message, "additional_kwargs", None),
+            getattr(message, "response_metadata", None),
+            getattr(message, "model_extra", None),
+        ):
+            txt = _from_dict(payload)
+            if txt:
+                return txt
         return ""
 
     async def run(
         self,
         prompt: str,
         output_model: OutputModel = None,
+        reasoning_effort: Optional[str] = None,
     ) -> RunOutput:
         messages = self.build_messages(prompt)
         user_msg = messages[-1]
+
+        extra_body: dict[str, object] = {"chat_template_kwargs": {"enable_thinking": True}}
+        request_kwargs: dict[str, object] = {}
+        if reasoning_effort:
+            chat_kwargs = extra_body["chat_template_kwargs"]
+            if isinstance(chat_kwargs, dict):
+                chat_kwargs["reasoning_effort"] = str(reasoning_effort)
+            request_kwargs["reasoning_effort"] = str(reasoning_effort)
+        llm_call = self.llm.bind(extra_body=extra_body)
+        if reasoning_effort:
+            llm_call = llm_call.bind(reasoning_effort=str(reasoning_effort))
+
+        if output_model is not None:
+            structured_llm = llm_call.with_structured_output(output_model)
+            parsed = await structured_llm.ainvoke(messages)
+            if not isinstance(parsed, BaseModel):
+                raise ValueError("structured output parsing failed")
+            self.message_history.append(user_msg)
+            self.message_history.append(AIMessage(content=parsed.model_dump_json()))
+            return "", parsed
+
         payload_messages = []
         for m in messages:
             role = "user"
@@ -102,36 +120,21 @@ class ChatClient(BaseClient):
                 role = "assistant"
             payload_messages.append({"role": role, "content": str(m.content)})
 
-        response = await self.llm.async_client.create(
-            model=self.model,
-            messages=payload_messages,
-            temperature=self.temperature,
-            max_tokens=self.max_output_tokens,
-            stream=False,
-            extra_body={"chat_template_kwargs": {"enable_thinking": True}},
-        )
-
+        request: dict[str, object] = {
+            "model": self.model,
+            "messages": payload_messages,
+            "temperature": self.temperature,
+            "stream": False,
+            "extra_body": extra_body,
+        }
+        if self.max_output_tokens is not None:
+            request["max_tokens"] = self.max_output_tokens
+        request.update(request_kwargs)
+        response = await self.llm.async_client.create(**request)
         choice = (getattr(response, "choices", None) or [None])[0]
-        message = getattr(choice, "message", None)
-        assistant_text = str(getattr(message, "content", "") or "")
-
-        reasoning = str(getattr(message, "reasoning", "") or "")
-        if not reasoning:
-            reasoning = str(getattr(message, "reasoning_content", "") or "")
-        if not reasoning:
-            extra = getattr(message, "model_extra", None) or {}
-            if isinstance(extra, dict):
-                reasoning = str(extra.get("reasoning") or extra.get("reasoning_content") or "")
-
-        if output_model is not None:
-            parsed: BaseModel
-            try:
-                parsed = output_model.model_validate_json(assistant_text)
-            except Exception:
-                parsed = output_model.model_validate(json.loads(assistant_text))
-            self.message_history.append(user_msg)
-            self.message_history.append(AIMessage(content=assistant_text))
-            return reasoning, parsed
+        response_message = getattr(choice, "message", None)
+        assistant_text = str(getattr(response_message, "content", "") or "")
+        reasoning = self._extract_reasoning(response_message)
 
         self.message_history.append(user_msg)
         self.message_history.append(AIMessage(content=assistant_text))

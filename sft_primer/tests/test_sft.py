@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -8,29 +9,48 @@ import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from sft_primer.train import process_input_folder_to_chunks, train_model_on_qa_pairs
+from inference.vllm_engine import VLLMEngine
+from sft_primer.train import (
+    generate_qa_for_chunk_with_lookbehind,
+    process_input_folder_to_chunks,
+    train_model_on_qa_pairs,
+)
 
 
-def _run() -> None:
+async def _run() -> None:
     md_path = Path("/media/blazingbhavneek/Common/Code/rl/sft_primer/input/intel/test.md")
     input_root = str(md_path.parents[1])
     output_root = str(md_path.parents[2] / "output")
     input_folder = md_path.parent.name
+    qa_port = int(os.environ.get("QA_PORT", "30000"))
+    chunk_concurrency = int(os.environ.get("CHUNK_CONCURRENCY", "10"))
+    train_epochs = int(os.environ.get("TRAIN_EPOCHS", "4"))
+    train_lr = float(os.environ.get("TRAIN_LR", "1e-5"))
+    infer_max_new_tokens = int(os.environ.get("INFER_MAX_NEW_TOKENS", "8192"))
 
     print("=== SFT Primer Test ===")
     print(f"md_path: {md_path}")
     print(f"input_root: {input_root}")
     print(f"output_root: {output_root}")
     print(f"input_folder: {input_folder}")
+    print(f"qa_port: {qa_port}")
+    print(f"chunk_concurrency: {chunk_concurrency}")
+    print(f"train_epochs: {train_epochs}")
+    print(f"train_lr: {train_lr}")
+    print(f"infer_max_new_tokens: {infer_max_new_tokens}")
 
     if not md_path.exists():
         raise FileNotFoundError(f"Markdown file not found: {md_path}")
 
-    out_path = process_input_folder_to_chunks(
-        input_folder=input_folder,
-        input_root=input_root,
-        output_root=output_root,
-    )
+    out_path = Path(output_root) / input_folder / "chunks.json"
+    if out_path.exists() and out_path.stat().st_size > 0:
+        print(f"chunks_checkpoint_found: {out_path}")
+    else:
+        out_path = process_input_folder_to_chunks(
+            input_folder=input_folder,
+            input_root=input_root,
+            output_root=output_root,
+        )
     print(f"chunks_file: {out_path}")
 
     chunks = json.loads(Path(out_path).read_text(encoding="utf-8"))
@@ -45,53 +65,98 @@ def _run() -> None:
         print("first_chunk_preview:")
         print(text_preview)
 
-    qa_pairs = []
-    questions = [
-        "このチャンクの要点を簡潔に要約してください。",
-        "このチャンクで説明される oneAPI/SYCL の目的は何ですか。",
-        "このチャンクに含まれる手順や利用方法を説明してください。",
-        "このチャンクに出てくる重要用語を挙げて説明してください。",
-        "このチャンクの内容から初心者向けの注意点を述べてください。",
-    ]
-    for row in chunks:
-        text = str(row.get("text", "")).strip()
-        if not text:
-            continue
-        source = str(row.get("source", "unknown"))
-        chunk_index = int(row.get("chunk_index", -1))
-        for q in questions:
-            qa_pairs.append(
-                {
-                    "question": q,
-                    "reasoning": (
-                        f"source={source}, chunk_index={chunk_index} の本文を根拠に、"
-                        "質問に対応する文を抽出して簡潔に再構成する。"
-                    ),
-                    "answer": text,
-                }
-            )
-    if not qa_pairs:
-        raise ValueError("No QA pairs could be created from chunks.")
-    print(f"chunks_for_qa: {len(chunks)}")
-    print(f"qa_pairs_count: {len(qa_pairs)}")
-    qa_pairs_path = Path(output_root) / input_folder / "qa_pair.json"
-    qa_pairs_path.parent.mkdir(parents=True, exist_ok=True)
-    with qa_pairs_path.open("w", encoding="utf-8") as f:
-        for row in qa_pairs:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    print(f"qa_pairs_file: {qa_pairs_path}")
+    chunk_texts = [str(row.get("text", "")).strip() for row in chunks if str(row.get("text", "")).strip()]
+    if not chunk_texts:
+        raise ValueError("No non-empty chunks found for QA generation.")
 
     train_model_path = os.environ.get(
         "MODEL_PATH",
         "/media/blazingbhavneek/Common/Code/sglangServer/Infer/Qwen/Qwen3-1.7B",
     )
+    engine = VLLMEngine(
+        model_path=train_model_path,
+        engine_kwargs={
+            "base_url": f"http://127.0.0.1:{qa_port}/v1",
+            "model_name": train_model_path,
+            "api_key": os.environ.get("OPENAI_API_KEY", ""),
+            "save_vllm_logs": True,
+            "gpu_memory_utilization": 0.90,
+            "reasoning_parser": "qwen3",
+            "enable_auto_tool_choice": True,
+            "tool_call_parser": "hermes",
+        },
+    )
+
+    qa_pairs_path = Path(output_root) / input_folder / "qa_pair.json"
+    qa_pairs = []
+    if qa_pairs_path.exists() and qa_pairs_path.stat().st_size > 0:
+        print(f"qa_checkpoint_found: {qa_pairs_path}")
+        with qa_pairs_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                qa_pairs.append(json.loads(line))
+    else:
+        try:
+            print("starting_qa_engine...")
+            await engine.start()
+            await engine.init()
+            print("qa_engine_ready")
+
+            sem = asyncio.Semaphore(max(1, chunk_concurrency))
+
+            async def _run_chunk(i: int) -> tuple[int, list[dict[str, str]]]:
+                async with sem:
+                    rows = await generate_qa_for_chunk_with_lookbehind(
+                        chunks=chunk_texts,
+                        chunk_index=i,
+                        lookbehind_chunks=2,
+                        num_questions=5,
+                        model_path=train_model_path,
+                        port=qa_port,
+                    )
+                    return i, rows
+
+            tasks = [asyncio.create_task(_run_chunk(i)) for i in range(len(chunk_texts))]
+            done = 0
+            total = len(tasks)
+            for fut in asyncio.as_completed(tasks):
+                i, rows = await fut
+                qa_pairs.extend(rows)
+                done += 1
+                print(
+                    f"qa_generated_for_chunk: {i + 1}/{len(chunk_texts)} "
+                    f"rows={len(rows)} done={done}/{total}"
+                )
+        finally:
+            print("shutting_down_qa_engine...")
+            await engine.shutdown()
+            print("qa_engine_shutdown_complete")
+
+    if not qa_pairs:
+        raise ValueError("No QA pairs could be created from chunks.")
+    print(f"chunks_for_qa: {len(chunk_texts)}")
+    print(f"qa_pairs_count: {len(qa_pairs)}")
+    if not (qa_pairs_path.exists() and qa_pairs_path.stat().st_size > 0):
+        qa_pairs_path.parent.mkdir(parents=True, exist_ok=True)
+        with qa_pairs_path.open("w", encoding="utf-8") as f:
+            for row in qa_pairs:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        print(f"qa_pairs_file: {qa_pairs_path}")
+    else:
+        print(f"qa_pairs_file_reused: {qa_pairs_path}")
+
     print(f"train_model_path: {train_model_path}")
-    print("starting_lora_training: epochs=1")
+    print(f"starting_lora_training: epochs={train_epochs}")
+    train_output_dir = str(Path(output_root) / input_folder)
+    print(f"train_output_dir: {train_output_dir}")
     adapter_dir = train_model_on_qa_pairs(
         qa_pairs=qa_pairs,
         train_model_path=train_model_path,
-        output_dir=output_root,
-        epochs=1,
+        output_dir=train_output_dir,
+        epochs=train_epochs,
+        lr=train_lr,
         train_batch_size=1,
         grad_accum_steps=1,
     )
@@ -108,8 +173,23 @@ def _run() -> None:
     model.eval()
 
     messages = [
-        {"role": "system", "content": "あなたは簡潔な日本語アシスタントです。"},
-        {"role": "user", "content": "この資料が説明している oneAPI/SYCL の要点を2行で述べてください。"},
+        {
+            "role": "system",
+            "content": (
+                "あなたは技術文書要約アシスタントです。"
+                "回答は日本語で、intel の oneAPI/SYCL 入門資料の内容だけに基づいてください。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "このチャンクの要点を簡潔に要約しつつ、"
+                "oneAPI/SYCL 入門として重要な点を説明してください。"
+                "特に、入手・導入方法、参照すべき入門ドキュメント、"
+                "SYCL サンプルコードの狙いを含めてください。"
+                "回答では関連箇所を思い出して照合した流れがわかるように書いてください。"
+            ),
+        },
     ]
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     tok = tokenizer([prompt], return_tensors="pt")
@@ -121,6 +201,7 @@ def _run() -> None:
         out = model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            max_new_tokens=infer_max_new_tokens,
             do_sample=False,
         )
     new_ids = out[:, input_ids.shape[1] :]
@@ -138,4 +219,4 @@ def _run() -> None:
 
 
 if __name__ == "__main__":
-    _run()
+    asyncio.run(_run())

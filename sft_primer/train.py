@@ -31,7 +31,7 @@ GLOBAL_LLM_SEMAPHORE = asyncio.Semaphore(50)
 
 class QuestionList(BaseModel):
     questions: List[str] = Field(
-        description="チャンク内の情報だけで答えられる、あらゆる種類の質問リスト"
+        description="本文情報だけで答えられる、自然で多様な質問リスト"
     )
 
 
@@ -40,7 +40,7 @@ class AnswerItem(BaseModel):
         description="与えられたコンテキストのみに基づく回答。厳密な表現があれば優先して使う。"
     )
     reasoning: str = Field(
-        description="回答に至る思考過程。文書のどの情報を手掛かりにしたかを自然文で説明する。"
+        description="回答に至る思考過程。根拠抽出→照合→結論の順で自然文で記述する。"
     )
 
 
@@ -110,10 +110,13 @@ async def generate_qa_for_chunk_with_lookbehind(
         base_url=base_url,
         api_key=api_key,
         temperature=0.7,
-        max_output_tokens=2048,
+        max_output_tokens=None,
         system_prompt=(
-            "あなたは与えられた文章から、本文だけで完全に答えられる質問を網羅的に作るアシスタントです。"
-            "質問の種類は限定しません。事実確認、定義、比較、手順、制約、注意点、例外、背景など多様に作ってください。"
+            "あなたは技術文書QAデータ作成アシスタントです。"
+            "与えられた本文だけで完全に答えられる質問を作成してください。"
+            "質問は、実利用のユーザー質問として自然な文にしてください。"
+            "質問文に「チャンク」「文脈」「上記本文」などのメタ表現を入れてはいけません。"
+            "質問の種類は限定せず、定義、手順、比較、制約、注意点、例外、背景をバランスよく含めてください。"
             "必ず JSON で {\"questions\": [\"...\"]} 形式のみを返してください。"
         ),
         model=model_path,
@@ -124,12 +127,16 @@ async def generate_qa_for_chunk_with_lookbehind(
         base_url=base_url,
         api_key=api_key,
         temperature=0.1,
-        max_output_tokens=2048,
+        max_output_tokens=None,
         system_prompt=(
-            "あなたはドキュメントQAアシスタントです。"
-            "回答は必ず与えられたコンテキストのみを根拠にしてください。"
-            "コンテキストに厳密な表現がある場合はその表現を優先して使ってください。"
-            "reasoning には、文書の記憶をたどって根拠を見つけたような自然な思考過程を書いてください。"
+            "あなたは技術文書QAアシスタントです。"
+            "回答は必ず与えられた本文のみを根拠にしてください。"
+            "本文に厳密な表現がある場合はその表現を優先してください。"
+            "reasoning は次の思考パターンに厳密に従ってください: "
+            "1) 質問の意図整理 2) 本文からの根拠抽出 3) 根拠同士の照合 4) 最終結論。"
+            "reasoning は自然な説明文で、簡潔だが論理のつながりが分かるように書いてください。"
+            "reasoning や answer に「チャンク」「文脈」「上記」などのメタ参照語を入れてはいけません。"
+            "本文に無い情報は推測せず、その旨を明示してください。"
             "必ず JSON で {\"answer\": \"...\", \"reasoning\": \"...\"} 形式のみを返してください。"
         ),
         model=model_path,
@@ -137,8 +144,12 @@ async def generate_qa_for_chunk_with_lookbehind(
 
     question_generator.reset_history()
     question_prompt = (
-        f"次のチャンクに基づいて、{max(1, int(num_questions))} 個の質問を作成してください。\n\n"
-        f"チャンク:\n{chunk_text}"
+        f"次の本文に基づいて、{max(1, int(num_questions))} 個の質問を作成してください。\n\n"
+        "要件:\n"
+        "- 質問は実利用のユーザーがそのまま尋ねる自然な文にする\n"
+        "- 質問文にメタ表現（例: チャンク、本文、上記）は入れない\n"
+        "- 同型の言い換えを避け、観点を分散させる\n\n"
+        f"本文:\n{chunk_text}"
     )
     async with GLOBAL_LLM_SEMAPHORE:
         _, question_obj = await question_generator.run(
@@ -152,10 +163,11 @@ async def generate_qa_for_chunk_with_lookbehind(
     async def _generate_answer_row(question: str) -> Dict[str, str]:
         answer_generator.reset_history()
         answer_prompt = (
-            f"コンテキスト:\n{context_text}\n\n"
+            f"本文:\n{context_text}\n\n"
             f"質問:\n{question}\n\n"
-            "上のコンテキストだけを使って日本語で回答してください。"
-            "reasoning では、関連箇所を思い出して照合した過程を簡潔に書いてください。"
+            "上の本文だけを使って日本語で回答してください。"
+            "reasoning は「意図整理→根拠抽出→照合→結論」の流れを明確に示してください。"
+            "reasoning と answer にメタ参照語（チャンク、文脈、上記）を含めないでください。"
         )
         async with GLOBAL_LLM_SEMAPHORE:
             _, answer_obj = await answer_generator.run(
@@ -208,6 +220,20 @@ def train_model_on_qa_pairs(
     lora_model_dir = output_root / "lora" / model_key
     ckpt_dir = output_root / "checkpoint" / model_key
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    completed_epoch = 0
+    for p in lora_model_dir.glob("epoch_*"):
+        if not p.is_dir():
+            continue
+        name = p.name
+        if not name.startswith("epoch_"):
+            continue
+        suffix = name.split("_", 1)[1]
+        if suffix.isdigit():
+            completed_epoch = max(completed_epoch, int(suffix))
+    if completed_epoch >= int(epochs):
+        final_dir = lora_model_dir / "final"
+        if final_dir.exists():
+            return str(final_dir)
 
     rng = random.Random(int(seed))
     rows = list(qa_pairs)
@@ -238,6 +264,16 @@ def train_model_on_qa_pairs(
         use_grad_checkpoint=True,
     )
     trainer = model_cls(model_path=train_model_path, config=train_cfg)
+    if completed_epoch > 0:
+        from peft import PeftModel
+
+        resume_dir = lora_model_dir / f"epoch_{completed_epoch}"
+        if resume_dir.exists():
+            trainer.model = PeftModel.from_pretrained(
+                trainer.model,
+                str(resume_dir),
+                is_trainable=True,
+            )
     trainer.model.train()
 
     # Convert raw QA rows into supervised (messages, completion_text) pairs.
@@ -294,7 +330,8 @@ def train_model_on_qa_pairs(
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     step_count = 0
-    for epoch in range(1, int(epochs) + 1):
+    start_epoch = completed_epoch + 1
+    for epoch in range(start_epoch, int(epochs) + 1):
         rng.shuffle(train_samples)
         optimizer.zero_grad(set_to_none=True)
         running_loss = 0.0
