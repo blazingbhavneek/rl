@@ -1,11 +1,14 @@
+import gc
 import time
 import warnings
 
 import torch
 from transformers import AutoTokenizer
+from transformers.masking_utils import create_causal_mask
 
 from model.config import ModelConfig
 from model.gptoss import GptOssModel
+from model.qwen3_5 import Qwen3_5Model
 
 warnings.filterwarnings(
     "ignore",
@@ -14,15 +17,14 @@ warnings.filterwarnings(
 )
 
 
-def test_gpt_oss_logit_parity_hf_vs_custom_forward() -> None:
+def run_logit_parity(
+    model_path: str, model_cls: type, lora_targets: list[str]
+) -> None:
     t0 = time.perf_counter()
-    model_path = (
-        "/media/blazingbhavneek/Common/Code/sglangServer/Infer/openai/gpt-oss-20b"
-    )
 
     print("[parity] building config")
     config = ModelConfig(
-        lora=["q_proj", "k_proj", "v_proj", "o_proj"],
+        lora=lora_targets,
         lora_fraction=0.25,
         lora_rank=128,
         lora_alpha=256,
@@ -33,7 +35,7 @@ def test_gpt_oss_logit_parity_hf_vs_custom_forward() -> None:
 
     print("[parity] loading custom model")
     t_load0 = time.perf_counter()
-    custom_model = GptOssModel(model_path=model_path, config=config)
+    custom_model = model_cls(model_path=model_path, config=config)
     custom_model.model.eval()
     print(f"[parity] custom model loaded in {time.perf_counter() - t_load0:.2f}s")
 
@@ -169,5 +171,21 @@ def test_gpt_oss_logit_parity_hf_vs_custom_forward() -> None:
 
 
 if __name__ == "__main__":
-    test_gpt_oss_logit_parity_hf_vs_custom_forward()
-    print("PASS: test_gpt_oss_logit_parity_hf_vs_custom_forward")
+    run_logit_parity(
+        "/media/blazingbhavneek/Common/Code/sglangServer/Infer/openai/gpt-oss-20b",
+        GptOssModel,
+        ["q_proj", "k_proj", "v_proj", "o_proj"],
+    )
+    print("PASS: gpt-oss parity")
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    run_logit_parity(
+        "/media/blazingbhavneek/Common/Code/sglangServer/Infer/Qwen/Qwen3.5-0.8B",
+        Qwen3_5Model,
+        ["gate_proj", "up_proj", "down_proj"],
+    )
+    print("PASS: qwen3.5 parity")
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()

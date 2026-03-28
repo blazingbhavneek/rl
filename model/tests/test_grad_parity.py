@@ -1,11 +1,16 @@
 import time
 import warnings
-
+import gc
 import torch
 from transformers import AutoTokenizer
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    torch_chunk_gated_delta_rule,
+    torch_recurrent_gated_delta_rule,
+)
 
 from model.config import ModelConfig
 from model.gptoss import GptOssModel
+from model.qwen3_5 import Qwen3_5Model
 
 warnings.filterwarnings(
     "ignore",
@@ -31,30 +36,30 @@ def _zero_all_grads(model: torch.nn.Module) -> None:
         p.grad = None
 
 
-def _peft_param_type(name: str) -> str:
-    if ".lora_A." in name:
-        return "lora_A"
-    if ".lora_B." in name:
-        return "lora_B"
-    if "lora_embedding_A" in name:
-        return "lora_embedding_A"
-    if "lora_embedding_B" in name:
-        return "lora_embedding_B"
-    if "modules_to_save" in name:
-        return "modules_to_save"
-    return "other_peft"
+def _force_qwen_torch_linear_attention_kernels(model: torch.nn.Module) -> None:
+    base = model.base_model.model if hasattr(model, "base_model") else model
+    inner = base.model if hasattr(base, "model") else base
+    if hasattr(inner, "language_model"):
+        inner = inner.language_model
+    if not hasattr(inner, "layers"):
+        return
+    for layer in inner.layers:
+        if hasattr(layer, "linear_attn"):
+            layer.linear_attn.chunk_gated_delta_rule = torch_chunk_gated_delta_rule
+            layer.linear_attn.recurrent_gated_delta_rule = (
+                torch_recurrent_gated_delta_rule
+            )
 
 
-def test_gpt_oss_grad_parity_hf_vs_custom_backward() -> None:
+def run_grad_parity(
+    model_path: str, model_cls: type, lora_targets: list[str]
+) -> None:
     t0 = time.perf_counter()
-    model_path = (
-        "/media/blazingbhavneek/Common/Code/sglangServer/Infer/openai/gpt-oss-20b"
-    )
 
     print("[grad-parity] building config")
     seed = 1337
     config = ModelConfig(
-        lora=["q_proj", "k_proj", "v_proj", "o_proj"],
+        lora=lora_targets,
         lora_fraction=0.25,
         lora_rank=128,
         lora_alpha=256,
@@ -76,8 +81,10 @@ def test_gpt_oss_grad_parity_hf_vs_custom_backward() -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     t_load0 = time.perf_counter()
-    baseline_model = GptOssModel(model_path=model_path, config=config)
+    baseline_model = model_cls(model_path=model_path, config=config)
     baseline_model.model.eval()
+    if model_cls is Qwen3_5Model:
+        _force_qwen_torch_linear_attention_kernels(baseline_model.model)
     print(f"[grad-parity] baseline model loaded in {time.perf_counter() - t_load0:.2f}s")
 
     print("[grad-parity] loading tokenizer")
@@ -215,60 +222,6 @@ def test_gpt_oss_grad_parity_hf_vs_custom_backward() -> None:
     mean_rel_diff_masked = mean_rel_diff_masked / max(1, n)
     rel_l2 = (sq_diff ** 0.5) / max(1e-12, sq_ref ** 0.5)
 
-    sampled_abs_diffs = []
-    global_abs_sum = 0.0
-    global_abs_numel = 0
-    global_abs_max = 0.0
-    type_stats: dict[str, dict[str, float]] = {}
-    for name in hf_keys:
-        abs_diff = (hf_lora_grads[name] - custom_lora_grads[name]).abs()
-        flat = abs_diff.reshape(-1)
-        global_abs_sum += float(flat.sum().item())
-        global_abs_numel += int(flat.numel())
-        global_abs_max = max(global_abs_max, float(flat.max().item()))
-
-        # Keep percentile estimation cheap on very large parameter sets.
-        if flat.numel() > 8192:
-            step = max(1, flat.numel() // 8192)
-            sampled_abs_diffs.append(flat[::step])
-        else:
-            sampled_abs_diffs.append(flat)
-
-        ptype = _peft_param_type(name)
-        bucket = type_stats.setdefault(
-            ptype,
-            {
-                "sum_abs": 0.0,
-                "numel": 0.0,
-                "max_abs": 0.0,
-                "sum_rel_masked": 0.0,
-                "count_params": 0.0,
-            },
-        )
-        mask = hf_lora_grads[name].abs() > rel_ref_floor
-        if mask.any():
-            rel_masked = (
-                abs_diff[mask] / (hf_lora_grads[name].abs()[mask] + eps)
-            ).mean().item()
-        else:
-            rel_masked = 0.0
-        bucket["sum_abs"] += float(flat.sum().item())
-        bucket["numel"] += float(flat.numel())
-        bucket["max_abs"] = max(bucket["max_abs"], float(flat.max().item()))
-        bucket["sum_rel_masked"] += float(rel_masked)
-        bucket["count_params"] += 1.0
-
-    flat_abs_sample = (
-        torch.cat(sampled_abs_diffs, dim=0)
-        if sampled_abs_diffs
-        else torch.zeros(1)
-    )
-    p50 = torch.quantile(flat_abs_sample, 0.50).item()
-    p90 = torch.quantile(flat_abs_sample, 0.90).item()
-    p99 = torch.quantile(flat_abs_sample, 0.99).item()
-    p999 = torch.quantile(flat_abs_sample, 0.999).item()
-    global_abs_mean = global_abs_sum / max(1, global_abs_numel)
-
     print(
         f"[grad-parity] peft_params={n} "
         f"hf_loss={hf_loss.item():.6f} custom_loss={custom_stats['loss']:.6f} "
@@ -277,31 +230,35 @@ def test_gpt_oss_grad_parity_hf_vs_custom_backward() -> None:
         f"mean_rel_diff_masked={mean_rel_diff_masked:.6f} "
         f"rel_l2={rel_l2:.6e}"
     )
-    print(
-        f"[grad-parity] peft abs-diff distribution: "
-        f"numel={global_abs_numel} mean={global_abs_mean:.6f} "
-        f"p50~={p50:.6f} p90~={p90:.6f} p99~={p99:.6f} p999~={p999:.6f} "
-        f"max={global_abs_max:.6f} sample_numel={flat_abs_sample.numel()}"
-    )
-    print("[grad-parity] PEFT type stats (all layers):")
-    for ptype in sorted(type_stats.keys()):
-        b = type_stats[ptype]
-        type_mean_abs = b["sum_abs"] / max(1.0, b["numel"])
-        type_mean_rel_masked = b["sum_rel_masked"] / max(1.0, b["count_params"])
-        print(
-            f"[grad-parity]   {ptype}: "
-            f"params={int(b['count_params'])} numel={int(b['numel'])} "
-            f"mean_abs={type_mean_abs:.6f} max_abs={b['max_abs']:.6f} "
-            f"mean_rel_masked={type_mean_rel_masked:.6f}"
-        )
     print(f"[grad-parity] total elapsed={time.perf_counter() - t0:.2f}s")
 
     # PEFT parity: use stable metrics across all trainable adapter params.
     assert mean_abs_diff < abs_tolerance, f"PEFT grad parity failed: mean_abs_diff={mean_abs_diff}"
     assert rel_l2 < rel_l2_tolerance, f"PEFT grad parity failed: rel_l2={rel_l2}"
     assert mean_rel_diff_masked < rel_tolerance, f"PEFT grad parity failed: mean_rel_diff_masked={mean_rel_diff_masked}"
+    del baseline_model
+    del custom_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
-    test_gpt_oss_grad_parity_hf_vs_custom_backward()
-    print("PASS: test_gpt_oss_grad_parity_hf_vs_custom_backward")
+    run_grad_parity(
+        "/media/blazingbhavneek/Common/Code/sglangServer/Infer/openai/gpt-oss-20b",
+        GptOssModel,
+        ["q_proj", "k_proj", "v_proj", "o_proj"],
+    )
+    print("PASS: gpt-oss grad parity")
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    run_grad_parity(
+        "/media/blazingbhavneek/Common/Code/sglangServer/Infer/Qwen/Qwen3.5-0.8B",
+        Qwen3_5Model,
+        ["gate_proj", "up_proj", "down_proj"],
+    )
+    print("PASS: qwen3.5 grad parity")
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print("PASS: run_grad_parity")
