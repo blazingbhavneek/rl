@@ -8,6 +8,7 @@ from transformers.masking_utils import create_causal_mask
 
 from model.config import ModelConfig
 from model.gptoss import GptOssModel
+from model.qwen3 import Qwen3Model
 from model.qwen3_5 import Qwen3_5Model
 
 warnings.filterwarnings(
@@ -28,7 +29,7 @@ def run_logit_parity(
         lora_fraction=0.25,
         lora_rank=128,
         lora_alpha=256,
-        chunk_size=None,
+        chunk_size=5,
         cuda_device_index=0,
         use_grad_checkpoint=False,
     )
@@ -50,7 +51,7 @@ def run_logit_parity(
         ],
         [
             {"role": "system", "content": "You are concise."},
-            {"role": "user", "content": "Say hello in five words exactly."},
+            {"role": "user", "content": "Write a small essay on AI"},
         ],
     ]
 
@@ -171,21 +172,21 @@ def run_logit_parity(
 
 
 if __name__ == "__main__":
+    # run_logit_parity(
+    #     "/media/blazingbhavneek/Common/Code/sglangServer/Infer/openai/gpt-oss-20b",
+    #     GptOssModel,
+    #     ["q_proj", "k_proj", "v_proj", "o_proj"],
+    # )
+    # print("PASS: gpt-oss parity")
+    # gc.collect()
+    # if torch.cuda.is_available():
+    #     torch.cuda.empty_cache()
     run_logit_parity(
-        "/media/blazingbhavneek/Common/Code/sglangServer/Infer/openai/gpt-oss-20b",
-        GptOssModel,
-        ["q_proj", "k_proj", "v_proj", "o_proj"],
-    )
-    print("PASS: gpt-oss parity")
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    run_logit_parity(
-        "/media/blazingbhavneek/Common/Code/sglangServer/Infer/Qwen/Qwen3.5-0.8B",
-        Qwen3_5Model,
+        "/media/blazingbhavneek/Common/Code/sglangServer/Infer/Qwen/Qwen3-1.7B",
+        Qwen3Model,
         ["gate_proj", "up_proj", "down_proj"],
     )
-    print("PASS: qwen3.5 parity")
+    print("PASS: qwen3 parity")
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

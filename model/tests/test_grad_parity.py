@@ -10,6 +10,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 
 from model.config import ModelConfig
 from model.gptoss import GptOssModel
+from model.qwen3 import Qwen3Model
 from model.qwen3_5 import Qwen3_5Model
 
 warnings.filterwarnings(
@@ -243,21 +244,21 @@ def run_grad_parity(
 
 
 if __name__ == "__main__":
+    # run_grad_parity(
+    #     "/media/blazingbhavneek/Common/Code/sglangServer/Infer/openai/gpt-oss-20b",
+    #     GptOssModel,
+    #     ["q_proj", "k_proj", "v_proj", "o_proj"],
+    # )
+    # print("PASS: gpt-oss grad parity")
+    # gc.collect()
+    # if torch.cuda.is_available():
+    #     torch.cuda.empty_cache()
     run_grad_parity(
-        "/media/blazingbhavneek/Common/Code/sglangServer/Infer/openai/gpt-oss-20b",
-        GptOssModel,
-        ["q_proj", "k_proj", "v_proj", "o_proj"],
-    )
-    print("PASS: gpt-oss grad parity")
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    run_grad_parity(
-        "/media/blazingbhavneek/Common/Code/sglangServer/Infer/Qwen/Qwen3.5-0.8B",
-        Qwen3_5Model,
+        "/media/blazingbhavneek/Common/Code/sglangServer/Infer/Qwen/Qwen3-1.7B",
+        Qwen3Model,
         ["gate_proj", "up_proj", "down_proj"],
     )
-    print("PASS: qwen3.5 grad parity")
+    print("PASS: qwen3 grad parity")
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
