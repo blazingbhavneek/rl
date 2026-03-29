@@ -345,6 +345,13 @@ class GRPOPipeline:
 
         await self._ensure_adapters(engine, train_model, cfg)
 
+        # initialize here so _build_stats always has it in scope
+        grpo_stats: list[dict] = []
+        refined: list[dict] = []
+        hints_given = 0
+        passed_after_hint = 0
+        sft_loss = 0.0
+
         sem = asyncio.Semaphore(max(1, semaphore_limit))
 
         async def _generate(messages: list[dict]) -> str:
