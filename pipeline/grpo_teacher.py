@@ -25,12 +25,12 @@ from taskset.codeforces import CodeforcesVerifier
 
 @dataclass(frozen=True)
 class _ModelProfile:
-    module: str                         # e.g. "model.qwen3"
-    cls_name: str                       # e.g. "Qwen3Model"
-    reasoning_parser: Optional[str]     # vLLM --reasoning-parser flag (None = omit)
-    tool_call_parser: str               # vLLM --tool-call-parser flag
-    teacher_extra_body: dict            # extra_body for AgentClient (thinking ON)
-    gen_extra_payload: dict             # extra fields in _generate payload (thinking OFF)
+    module: str
+    cls_name: str
+    reasoning_parser: Optional[str]
+    tool_call_parser: str
+    teacher_extra_body: dict
+    gen_extra_payload: dict
 
 
 _MODEL_PROFILES: dict[str, _ModelProfile] = {
@@ -55,7 +55,7 @@ _MODEL_PROFILES: dict[str, _ModelProfile] = {
         cls_name="GptOssModel",
         reasoning_parser=None,
         tool_call_parser="openai",
-        teacher_extra_body={},           # reasoning ON by default for gpt-oss
+        teacher_extra_body={},
         gen_extra_payload={"include_reasoning": False},
     ),
 }
@@ -97,6 +97,7 @@ class TrainConfig:
     n_rollouts: int = 8
     temperature: float = 0.7
     system_prompt: str = "Solve the problem in C. Return only one ```c``` code block."
+    max_tokens: int = 16000
 
     # --- teacher ---
     teacher_temperature: float = 0.2
@@ -146,13 +147,19 @@ class TrainConfig:
 
 class GRPOPipeline:
     """
-    Owns the full training lifecycle:
-      - vLLM engine init / sleep / shutdown
-      - rollout generation and scoring
-      - teacher hint correction + SFT on corrected completions
-      - GRPO gradient accumulation
-      - optimizer step
-      - curriculum advancement
+    Owns the full training lifecycle.
+
+    GPU schedule per step:
+      generate (vLLM awake)
+        → teacher refine (vLLM awake)
+          → sleep vLLM
+            → GRPO backprop (accumulate grads)
+            → SFT backprop on solved teacher fixes (accumulate grads)
+          → wake vLLM
+        → optimizer.step()
+        → LoRA swap to vLLM (if configured)
+        → curriculum update
+      → next step
     """
 
     def __init__(self, config: TrainConfig) -> None:
@@ -207,15 +214,13 @@ class GRPOPipeline:
         await self._engine_init(engine)
 
         # -- teacher client --
-        # An external teacher_client (e.g. AgentClient with RAG tools) can be
-        # passed in via train(teacher_client=...) to override the default.
         if teacher_client is None:
             from client.agent import AgentClient
             teacher_client = AgentClient(
                 base_url=cfg.engine_base_url,
                 api_key=cfg.engine_api_key,
                 temperature=cfg.teacher_temperature,
-                max_output_tokens=None,
+                max_output_tokens=cfg.max_tokens,
                 system_prompt=(
                     "You are a coding tutor. Provide concise guidance only. "
                     "Do not explicitly provide the final correct answer."
@@ -292,6 +297,19 @@ class GRPOPipeline:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
+                # push updated LoRA weights into vLLM
+                if cfg.student_adapter_path:
+                    adapter_save_path = str(
+                        Path(cfg.student_adapter_path) / f"step_{step}"
+                    )
+                    train_model.save_lora_adapter(
+                        cfg.student_adapter_name, adapter_save_path
+                    )
+                    await engine.swap_lora_adapter(
+                        cfg.student_adapter_name, adapter_save_path
+                    )
+                    print(f"[lora-swap] pushed step={step} weights into vLLM")
+
                 print(
                     f"step={step} "
                     f"sampled={sampled_buckets} "
@@ -308,7 +326,7 @@ class GRPOPipeline:
             await self._engine_shutdown(engine)
 
     # ------------------------------------------------------------------
-    # Single batch: rollout → teacher correction → backprop
+    # Single batch
     # ------------------------------------------------------------------
 
     async def run_batch(
@@ -327,7 +345,6 @@ class GRPOPipeline:
         cfg = self.cfg
         profile = self.profile
 
-        # optional adapter setup
         await self._ensure_adapters(engine, train_model, cfg)
 
         sem = asyncio.Semaphore(max(1, semaphore_limit))
@@ -337,9 +354,9 @@ class GRPOPipeline:
                 "model": cfg.model_path,
                 "messages": messages,
                 "temperature": cfg.temperature,
+                "max_tokens": cfg.max_tokens,
                 "stream": False,
             }
-            # model-specific: disable thinking/reasoning during rollouts
             payload.update(profile.gen_extra_payload)
             if cfg.student_adapter_path:
                 payload["lora_name"] = cfg.student_adapter_name
@@ -355,7 +372,7 @@ class GRPOPipeline:
                 reward += 0.1
             return sc, reward, bool(sc.total > 0 and sc.passed == sc.total)
 
-        # ── phase 1: rollouts ──────────────────────────────────────────
+        # ── phase 1: rollouts (vLLM awake) ────────────────────────────
         gen_tasks = []
         for problem in batch:
             messages = [
@@ -376,7 +393,7 @@ class GRPOPipeline:
 
         _log_rollout_stats("grpo-rollouts", current)
 
-        # ── phase 2: teacher correction ────────────────────────────────
+        # ── phase 2: teacher correction (vLLM still awake) ────────────
         refine_candidates = {
             "current":  [r for r in current if not r["passed"]],
             "previous": self._prev_failed_rollouts,
@@ -392,8 +409,21 @@ class GRPOPipeline:
                 refine_candidates, _generate, _score, teacher_client
             )
             _log_rollout_stats("teacher-fixes", refined, extra=f"hints={hints_given}")
+            
+            # teacher fix stats
+            n_input_failures = len(refine_candidates)
+            n_fixed = passed_after_hint
+            fix_rate = 100 * n_fixed / n_input_failures if n_input_failures > 0 else 0
+            print(f"[teacher] fixed {n_fixed}/{n_input_failures} ({fix_rate:.1f}%)")
 
-        # ── phase 3a: GRPO backprop (current rollouts only) ───────────
+        # ── sleep vLLM — all generation done ──────────────────────────
+        try:
+            await engine.sleep(level=1)
+            print("[vllm] sleeping for backprop")
+        except Exception as exc:
+            print(f"[vllm] sleep unavailable: {exc}")
+
+        # ── phase 3a: GRPO backprop ───────────────────────────────────
         device = next(train_model.model.parameters()).device
         if cfg.student_adapter_path:
             train_model.set_active_lora_adapter(cfg.student_adapter_name)
@@ -414,16 +444,24 @@ class GRPOPipeline:
             ))
         print(f"[grpo-backprop] completed={len(grpo_stats)}/{len(batch)}")
 
-        # ── phase 3b: SFT backprop (teacher-corrected only) ───────────
+        # ── phase 3b: SFT backprop (solved teacher fixes only) ────────
         sft_loss = 0.0
-        if refined:
+        sft_candidates = [r for r in refined if r["passed"]]
+        if sft_candidates:
             sft_loss = self._sft_step(
-                refined=refined,
+                refined=sft_candidates,
                 train_model=train_model,
             )
-            print(f"[sft-backprop] samples={len(refined)} loss={sft_loss:.4f}")
+            print(f"[sft-backprop] samples={len(sft_candidates)} loss={sft_loss:.4f}")
 
-        # ── bookkeeping for next step ──────────────────────────────────
+        # ── wake vLLM — ready for optimizer step + next rollouts ──────
+        try:
+            await engine.wake()
+            print("[vllm] awake for next step")
+        except Exception as exc:
+            print(f"[vllm] wake unavailable: {exc}")
+
+        # ── bookkeeping ───────────────────────────────────────────────
         self._prev_failed_rollouts = self._build_failed_cache(current)
 
         return self._build_stats(batch, current, refined, grpo_stats,
@@ -534,7 +572,7 @@ class GRPOPipeline:
         return float(bp.get("loss", 0.0))
 
     # ------------------------------------------------------------------
-    # Teacher refinement
+    # Teacher refinement (concurrent)
     # ------------------------------------------------------------------
 
     async def _teacher_refine(
@@ -545,83 +583,111 @@ class GRPOPipeline:
         teacher_client,
     ) -> tuple[list[dict], int, int]:
         cfg = self.cfg
-        refined: list[dict] = []
+        sem = asyncio.Semaphore(max(1, cfg.engine_semaphore_limit))
+        pbar = tqdm(total=len(candidates) * cfg.max_hint_attempts, desc="teacher-refine", leave=False)
+
+        # import once, not per-iteration
+        from client.agent import AgentClient
+
+        async def _refine_one(rec: dict) -> tuple[dict, int, int]:
+            problem = rec["problem"]
+            best_text = str(rec["text"])
+            best_score = rec["score"]
+            best_reward = float(rec["reward"])
+            solved = False
+            local_hints = 0
+            local_passed = 0
+
+            for attempt_idx in range(cfg.max_hint_attempts):
+                _status = "did not compile" if not best_score.compiled else (
+                    f"compiled, passed {best_score.passed}/{best_score.total} tests"
+                )
+                _details = ""
+                if best_score.details:
+                    _details = f"\nTest details:\n{best_score.details}"
+                teacher_prompt = (
+                    "You are a coding tutor. Give a targeted hint only. "
+                    "Do NOT explicitly provide the right answer.\n\n"
+                    f"Problem:\n{problem.statement}\n\n"
+                    f"Student attempt:\n{best_text}\n\n"
+                    f"Verifier result: {_status}\n"
+                    f"Error: {best_score.error or 'none'}"
+                    f"{_details}\n\n"
+                    "Return one concise guidance hint."
+                )
+
+                # inject reference solution so the teacher can give targeted hints
+                ref_answer = (problem.metadata or {}).get("answer", "")
+                if ref_answer:
+                    teacher_prompt += (
+                        "\n\n[Reference solution — for YOUR guidance ONLY, "
+                        "do NOT reveal it to the student]:\n"
+                        f"{ref_answer}"
+                    )
+
+                # fresh client per candidate — no shared history across coroutines
+                local_teacher = AgentClient(
+                    base_url=teacher_client.llm.openai_api_base,
+                    api_key=teacher_client.llm.openai_api_key,
+                    temperature=teacher_client.llm.temperature,
+                    max_output_tokens=teacher_client.llm.max_tokens,
+                    system_prompt=teacher_client.system_prompt,
+                    model=teacher_client.llm.model_name,
+                    tools=[],
+                    max_turns=teacher_client.max_turns,
+                    extra_body=self.profile.teacher_extra_body,
+                )
+
+                async with sem:
+                    _, teacher_out = await local_teacher.run(prompt=teacher_prompt)
+                local_hints += 1
+
+                retry_messages = [
+                    {"role": "system", "content": cfg.system_prompt},
+                    {"role": "user", "content": (
+                        f"{problem.statement}\n\n"
+                        "Your previous answer was incorrect.\n"
+                        f"Hint:\n{teacher_out}\n\n"
+                        "Try again with a corrected answer."
+                    )},
+                ]
+                retry_txt = await generate_fn(retry_messages)
+                pbar.update(1)
+
+                retry_sc, retry_reward, retry_passed = await score_fn(problem, retry_txt)
+                retry_reward *= cfg.hint_reward_discount
+
+                if retry_reward > best_reward:
+                    best_text, best_score, best_reward = retry_txt, retry_sc, retry_reward
+                if retry_passed:
+                    local_passed += 1
+                    solved = True
+                    pbar.update(cfg.max_hint_attempts - attempt_idx - 1)
+                    break
+
+            return dict(
+                problem=problem,
+                messages=[
+                    {"role": "system", "content": cfg.system_prompt},
+                    {"role": "user", "content": str(problem.statement)},
+                ],
+                text=best_text,
+                score=best_score,
+                reward=best_reward,
+                passed=solved,
+            ), local_hints, local_passed
+
+        tasks = [_refine_one(rec) for rec in candidates]
+        results = await asyncio.gather(*tasks)
+        pbar.close()
+
+        refined = []
         hints_given = 0
         passed_after_hint = 0
-
-        total = len(candidates) * cfg.max_hint_attempts
-        with tqdm(total=total, desc="teacher-refine", leave=False) as pbar:
-            for rec in candidates:
-                problem = rec["problem"]
-                best_text = str(rec["text"])
-                best_score = rec["score"]
-                best_reward = float(rec["reward"])
-                solved = False
-
-                for _ in range(cfg.max_hint_attempts):
-                    _status = "did not compile" if not best_score.compiled else (
-                        f"compiled, passed {best_score.passed}/{best_score.total} tests"
-                    )
-                    _details = ""
-                    if best_score.details:
-                        _details = f"\nTest details:\n{best_score.details}"
-                    teacher_prompt = (
-                        "You are a coding tutor. Give a targeted hint only. "
-                        "Do NOT explicitly provide the right answer.\n\n"
-                        f"Problem:\n{problem.statement}\n\n"
-                        f"Student attempt:\n{best_text}\n\n"
-                        f"Verifier result: {_status}\n"
-                        f"Error: {best_score.error or 'none'}"
-                        f"{_details}\n\n"
-                        "Return one concise guidance hint."
-                    )
-
-                    # inject reference solution so the teacher can give targeted hints
-                    ref_answer = (problem.metadata or {}).get("answer", "")
-                    if ref_answer:
-                        teacher_prompt += (
-                            "\n\n[Reference solution — for YOUR guidance ONLY, "
-                            "do NOT reveal it to the student]:\n"
-                            f"{ref_answer}"
-                        )
-
-                    teacher_client.reset_history()
-                    _, teacher_out = await teacher_client.run(prompt=teacher_prompt)
-                    hints_given += 1
-
-                    retry_messages = [
-                        {"role": "system", "content": cfg.system_prompt},
-                        {"role": "user", "content": (
-                            f"{problem.statement}\n\n"
-                            "Your previous answer was incorrect.\n"
-                            f"Hint:\n{teacher_out}\n\n"
-                            "Try again with a corrected answer."
-                        )},
-                    ]
-                    retry_txt = await generate_fn(retry_messages)
-                    pbar.update(1)
-
-                    retry_sc, retry_reward, retry_passed = await score_fn(problem, retry_txt)
-                    retry_reward *= cfg.hint_reward_discount
-
-                    if retry_reward > best_reward:
-                        best_text, best_score, best_reward = retry_txt, retry_sc, retry_reward
-                    if retry_passed:
-                        passed_after_hint += 1
-                        solved = True
-                        break
-
-                refined.append(dict(
-                    problem=problem,
-                    messages=[
-                        {"role": "system", "content": cfg.system_prompt},
-                        {"role": "user", "content": str(problem.statement)},
-                    ],
-                    text=best_text,
-                    score=best_score,
-                    reward=best_reward,
-                    passed=solved,
-                ))
+        for result, h, p in results:
+            refined.append(result)
+            hints_given += h
+            passed_after_hint += p
 
         return refined, hints_given, passed_after_hint
 
@@ -630,6 +696,7 @@ class GRPOPipeline:
     # ------------------------------------------------------------------
 
     async def _ensure_adapters(self, engine, train_model, cfg: TrainConfig) -> None:
+        """Lazy-load LoRA adapters on first call."""
         if not hasattr(self, "_loaded_engine_adapters"):
             self._loaded_engine_adapters: set[str] = set()
             self._loaded_train_adapters: set[str] = set()
@@ -652,6 +719,7 @@ class GRPOPipeline:
                 self._loaded_train_adapters.add(cfg.ref_adapter_name)
 
     def _build_failed_cache(self, current: list[dict]) -> list[dict]:
+        """Collect failed rollouts; attach best peer solution for next step's teacher."""
         by_problem: dict[int, list[dict]] = {}
         for r in current:
             by_problem.setdefault(id(r["problem"]), []).append(r)

@@ -32,14 +32,14 @@ SEED = 42
 # └──────────┴─────────────────────────────────────────────────────────────┘
 
 MODEL_TYPE = "qwen3"
-MODEL_PATH = "/media/blazingbhavneek/Common/Code/sglangServer/Infer/Qwen/Qwen3-1.7B"
+MODEL_PATH = "Qwen/Qwen3-8B"
 
 # which linear projections to attach LoRA to (suffix layers only, per lora_fraction)
 LORA_TARGETS = ["gate_proj", "up_proj", "down_proj"]
 LORA_FRACTION = 0.5     # fraction of layers from the top that are trainable
 LORA_RANK = 64
 LORA_ALPHA = 128        # typically 2× rank
-CHUNK_SIZE = 256        # token chunk size for chunked logprob computation (memory vs speed)
+CHUNK_SIZE = 10        # token chunk size for chunked logprob computation (memory vs speed)
 CUDA_DEVICE = 0
 GRAD_CHECKPOINT = True  # activation checkpointing in suffix layers
 
@@ -47,7 +47,7 @@ GRAD_CHECKPOINT = True  # activation checkpointing in suffix layers
 ENGINE_BASE_URL = "http://127.0.0.1:8000/v1"
 ENGINE_API_KEY = "EMPTY"
 # fraction of GPU VRAM reserved for vLLM; remainder goes to train_model
-ENGINE_GPU_MEM = 0.60
+ENGINE_GPU_MEM = 0.50
 ENGINE_SEMAPHORE = 32   # max concurrent generation requests
 
 # ── rollouts ──────────────────────────────────────────────────────────────────
@@ -73,7 +73,7 @@ TEACHER_MAX_TURNS = 6       # max tool-call rounds; with tools=[] exits on 1st t
 
 # ── LoRA adapters (set paths to enable; None = no adapter) ───────────────────
 STUDENT_ADAPTER_NAME = "student"
-STUDENT_ADAPTER_PATH = None  # path to saved student adapter, or None for base model
+STUDENT_ADAPTER_PATH = "checkpoints/student_lora"  # path to saved student adapter, or None for base model
 REF_ADAPTER_NAME = None      # reference adapter for KL penalty; None = disable KL
 REF_ADAPTER_PATH = None
 
@@ -90,7 +90,7 @@ GRAD_CLIP = 1.0         # max gradient norm before clipping
 # ── curriculum ────────────────────────────────────────────────────────────────
 DATASET_DIR = "taskset/codeforces/data"
 TRAIN_STEPS = 10        # total optimizer steps
-SAMPLE_SIZE = 10        # problems sampled per step
+SAMPLE_SIZE = 2        # problems sampled per step
 N_BUCKETS = 9           # difficulty buckets (e.g. Codeforces A–G mapped to 1–9)
 INITIAL_MEAN = 0.6      # starting bucket mean (0=easiest, 1=hardest)
 CURRICULUM_STD = 1.0    # spread of the Gaussian sampling distribution over buckets

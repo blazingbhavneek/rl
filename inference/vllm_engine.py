@@ -34,6 +34,7 @@ class VLLMEngine(BaseEngine):
         self.base_url = str(engine_kwargs.get("base_url", "http://localhost:8000/v1")).rstrip("/")
         self.api_key = str(engine_kwargs["api_key"]) if engine_kwargs.get("api_key") is not None else ""
         self.model_name = str(engine_kwargs.get("model_name", self.model_path))
+        self._request_timeout = float(engine_kwargs.get("request_timeout", 600)) 
         self.reasoning_parser = (
             str(engine_kwargs["reasoning_parser"]) if engine_kwargs.get("reasoning_parser") else None
         )
@@ -46,14 +47,17 @@ class VLLMEngine(BaseEngine):
         self.enable_auto_tool_choice = bool(engine_kwargs.get("enable_auto_tool_choice", False))
         self.is_awake = True
 
-    async def _request_json(self, method: str, path: str, payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    async def _request_json(self, method: str, path: str, payload: Optional[dict[str, Any]] = None, timeout: Optional[float] = None) -> dict[str, Any]:
         admin_paths = {"/sleep", "/wake_up", "/is_sleeping", "/shutdown"}
         if path in admin_paths or path.startswith("/sleep?"):
             parsed = urllib.parse.urlparse(self.base_url)
             root_base = f"{parsed.scheme}://{parsed.netloc}"
             url = f"{root_base}{path}"
+            _timeout = 60          # admin ops should be fast
         else:
             url = f"{self.base_url}{path}"
+            _timeout = timeout or self._request_timeout   # long for generation
+
         data: bytes | None = None
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")
@@ -63,7 +67,7 @@ class VLLMEngine(BaseEngine):
         req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
 
         def _send() -> dict[str, Any]:
-            with urllib.request.urlopen(req, timeout=180) as resp:
+            with urllib.request.urlopen(req, timeout=300) as resp:
                 raw = resp.read().decode("utf-8")
                 if not raw:
                     return {}

@@ -12,7 +12,10 @@ from .base import BaseModel
 
 # endregion
 
-
+# TODO: REMOVE CPU Overhead
+# _forward_suffix using torch.all
+# using linear attn mask
+# then do a parity check
 class Qwen3Model(BaseModel):
 
     def setup(self) -> None:
