@@ -50,3 +50,13 @@ class BaseVerifier(ABC):
         Validate runtime dependencies (compiler/libs/tools).
         Must raise SystemExit on hard failure.
         """
+
+class BaseDataset(ABC):
+    @abstractmethod
+    def n_buckets(self) -> int: ...
+
+    @abstractmethod
+    def get_bucket(self, idx: int) -> List[Problem]: ...
+
+    @abstractmethod
+    def get_problem_bucket(self, problem_id: str) -> Optional[int]: ...

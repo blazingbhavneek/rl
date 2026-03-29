@@ -18,10 +18,7 @@ from taskset.base import Problem, Score
 from taskset import BucketDistribution, CurriculumLoader
 from taskset.codeforces import CodeforcesVerifier
 
-
-# ---------------------------------------------------------------------------
-# Model profiles — per-model engine + inference settings
-# ---------------------------------------------------------------------------
+# region Model Profiles: For custom forward/backward implementations of selected models
 
 @dataclass(frozen=True)
 class _ModelProfile:
@@ -32,6 +29,7 @@ class _ModelProfile:
     teacher_extra_body: dict
     gen_extra_payload: dict
 
+# TODO: check these, enable thinking for all
 
 _MODEL_PROFILES: dict[str, _ModelProfile] = {
     "qwen3": _ModelProfile(
@@ -69,11 +67,11 @@ def _get_profile(model_type: str) -> _ModelProfile:
         )
     return _MODEL_PROFILES[model_type]
 
+# endregion Model Profiles
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
+# region Training config: For the training loop
 
+# TODO: add comments for each config point
 @dataclass
 class TrainConfig:
     # --- model ---
@@ -141,10 +139,9 @@ class TrainConfig:
     verifier_timeout: float = 5.0
     verifier_workers: int = 16
 
+# endregion Training config
 
-# ---------------------------------------------------------------------------
-# Pipeline
-# ---------------------------------------------------------------------------
+# region Pipeline
 
 class GRPOPipeline:
     """
@@ -164,21 +161,25 @@ class GRPOPipeline:
     """
 
     def __init__(self, config: TrainConfig) -> None:
+
         self.cfg = config
-        self.profile = _get_profile(config.model_type)
+        self.profile = _get_profile(config.model_type) # for custom model
+        
         self._prev_failed_rollouts: list[dict] = []
+        
         self._adapters_initialized = False
         self._lora_in_vllm = False  # True after first swap
 
     # ------------------------------------------------------------------
-    # Public entry point
+    # Training Loop
     # ------------------------------------------------------------------
 
     async def train(self, teacher_client: Optional[BaseClient] = None) -> None:
         cfg = self.cfg
         profile = self.profile
 
-        # -- build training model --
+        # region training model: the one which backprops
+ 
         from model.config import ModelConfig
         from algo import AlgoConfig
 
@@ -193,10 +194,15 @@ class GRPOPipeline:
         )
         ModelCls = getattr(importlib.import_module(profile.module), profile.cls_name)
         train_model = ModelCls(cfg.model_path, model_cfg)
+        
+        # TODO: Setup variable LR for stability
         trainable_params = [p for p in train_model.model.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(trainable_params, lr=cfg.lr)
 
-        # -- build inference engine --
+        # endregion
+
+        # region inference engine: faster rollouts and teacher client
+
         has_runtime_lora = True
         engine_kwargs: dict = {
             "base_url": cfg.engine_base_url,
@@ -233,8 +239,12 @@ class GRPOPipeline:
                 max_turns=cfg.teacher_max_turns,
                 extra_body=profile.teacher_extra_body,
             )
+        
+        # endregion
 
-        # -- verifier --
+        # region Algo, dataloader, bucket scheduler, verifier
+
+        # TODO: Change for custom dataset
         verifier = CodeforcesVerifier(timeout=cfg.verifier_timeout, n_workers=cfg.verifier_workers)
         verifier.check_dependencies()
 
@@ -267,7 +277,10 @@ class GRPOPipeline:
             require_full_bucket_coverage=cfg.require_full_bucket_coverage,
         )
 
-        # -- training loop --
+        # endregion
+
+        # region training loop 
+
         optimizer.zero_grad(set_to_none=True)
         step = 0
         step_bar = tqdm(total=cfg.train_steps, desc="train-steps", leave=True)
@@ -325,6 +338,9 @@ class GRPOPipeline:
         finally:
             step_bar.close()
             await self._engine_shutdown(engine)
+        
+        # endregion
+
 
     # ------------------------------------------------------------------
     # Single batch
@@ -343,6 +359,9 @@ class GRPOPipeline:
         semaphore_limit: int = 32,
         refine_mode: str = "previous",
     ) -> dict:
+        
+        # region Setup & Helpers: bind config/profile, ensure adapters, init accumulators, and define local helper funcs
+        
         cfg = self.cfg
         profile = self.profile
 
@@ -375,7 +394,8 @@ class GRPOPipeline:
                 resp = await engine._request_json("POST", "/chat/completions", payload)
             msg = ((resp.get("choices") or [{}])[0].get("message") or {})
             return str(msg.get("content") or "").strip()
-
+        
+        # TODO: Change the score function
         async def _score(problem: Problem, text: str) -> tuple[Score, float, bool]:
             sc = verifier(problem, text)
             reward = (float(sc.passed) / float(sc.total)) if sc.total > 0 else 0.0
@@ -383,7 +403,10 @@ class GRPOPipeline:
                 reward += 0.1
             return sc, reward, bool(sc.total > 0 and sc.passed == sc.total)
 
-        # ── phase 1: rollouts (vLLM awake) ────────────────────────────
+        # endregion Setup & Helpers: bind config/profile, ensure adapters, init accumulators, and define local helper funcs
+
+        # region Phase 1 - Rollout Generation: generate and score rollout samples for each problem in the batch
+
         gen_tasks = []
         for problem in batch:
             messages = [
@@ -404,7 +427,10 @@ class GRPOPipeline:
 
         _log_rollout_stats("grpo-rollouts", current)
 
-        # ── phase 2: teacher correction (vLLM still awake) ────────────
+        # endregion Phase 1 - Rollout Generation: generate and score rollout samples for each problem in the batch
+
+        # region Phase 2 - Teacher Refinement: refine failed candidates (current/previous/none based on refine_mode)
+
         refine_candidates = {
             "current":  [r for r in current if not r["passed"]],
             "previous": self._prev_failed_rollouts,
@@ -419,14 +445,16 @@ class GRPOPipeline:
             n_input = len(refine_candidates)
             print(f"[teacher] fixed {passed_after_hint}/{n_input} ({100*passed_after_hint/n_input:.1f}%)")
 
-        # ── sleep vLLM — all generation done ──────────────────────────
+        # endregion Phase 2 - Teacher Refinement: refine failed candidates (current/previous/none based on refine_mode)
+
+        # region Phase 3 - Backprop With Engine Sleep/Wake: sleep engine, run GRPO and SFT updates, then wake engine
+
         try:
             await engine.sleep(level=1)
             print("[vllm] sleeping for backprop")
         except Exception as exc:
             print(f"[vllm] sleep unavailable: {exc}")
 
-        # ── phase 3a: GRPO backprop ───────────────────────────────────
         device = next(train_model.model.parameters()).device
         actual_adapters = list(train_model.model.peft_config.keys())
         active_name = cfg.student_adapter_name if cfg.student_adapter_name in actual_adapters else actual_adapters[0]
@@ -447,21 +475,24 @@ class GRPOPipeline:
             ))
         print(f"[grpo-backprop] completed={len(grpo_stats)}/{len(batch)}")
 
-        # ── phase 3b: SFT backprop (solved teacher fixes only) ────────
         sft_candidates = [r for r in refined if r["passed"]]
         if sft_candidates:
             sft_loss = self._sft_step(refined=sft_candidates, train_model=train_model)
             print(f"[sft-backprop] samples={len(sft_candidates)} loss={sft_loss:.4f}")
 
-        # ── wake vLLM ─────────────────────────────────────────────────
         try:
             await engine.wake()
             print("[vllm] awake for next step")
         except Exception as exc:
             print(f"[vllm] wake unavailable: {exc}")
 
-        # ── bookkeeping ───────────────────────────────────────────────
+        # endregion Phase 3 - Backprop With Engine Sleep/Wake: sleep engine, run GRPO and SFT updates, then wake engine
+
+        # region Bookkeeping & Return: cache failed rollouts for next batch and return summarized stats
+
         self._prev_failed_rollouts = self._build_failed_cache(current)
+
+        # endregion Bookkeeping & Return: cache failed rollouts for next batch and return summarized stats
 
         return self._build_stats(batch, current, refined, grpo_stats,
                                  hints_given, passed_after_hint, sft_loss)
@@ -481,11 +512,14 @@ class GRPOPipeline:
         n_problems: int,
         cfg: TrainConfig,
     ) -> dict:
+
+        # Unpack all rollouts for this single problem prompt.
         base_messages = rows[0]["messages"]
         completions = [r["text"] for r in rows]
         scores = [r["score"] for r in rows]
         rewards = [float(r["reward"]) for r in rows]
 
+        # Tokenize prompt once (chat template) and all sampled completions.
         prompt_text = tokenizer.apply_chat_template(
             base_messages, tokenize=False, add_generation_prompt=True,
         )
@@ -498,16 +532,18 @@ class GRPOPipeline:
         completion_ids = comp_tok["input_ids"].to(device, non_blocking=True)
         completion_mask = comp_tok["attention_mask"].to(device, dtype=torch.float32, non_blocking=True)
 
+        # Broadcast a single prompt across G completions when needed.
         g = completion_ids.shape[0]
         if prompt_ids.shape[0] == 1 and g > 1:
             prompt_ids = prompt_ids.expand(g, -1)
             prompt_mask = prompt_mask.expand(g, -1)
 
+        # Build full sequences for model forwards, while keeping completion length for slicing.
         full_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         full_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         comp_len = completion_ids.shape[1]
 
-        # old log-probs (frozen forward)
+        # Compute old policy log-probs in inference mode; these are GRPO baselines.
         with torch.inference_mode():
             h_pre, pos = train_model._forward_prefix(full_ids, full_mask)
             h_suf = train_model._forward_suffix(h_pre, pos, full_mask)
@@ -515,7 +551,7 @@ class GRPOPipeline:
             old_lp = train_model._token_logprobs_chunked(h_comp, completion_ids).detach()
         algo.bind_old_logprobs(old_lp.cpu())
 
-        # optional ref log-probs
+        # Optionally compute reference log-probs for KL if a ref adapter is configured.
         if cfg.ref_adapter_path and hasattr(algo, "bind_ref_logprobs"):
             train_model.set_active_lora_adapter(cfg.ref_adapter_name)
             with torch.inference_mode():
@@ -527,6 +563,7 @@ class GRPOPipeline:
             if cfg.student_adapter_path:
                 train_model.set_active_lora_adapter(cfg.student_adapter_name)
 
+        # Build GRPO loss function from rollout data (scores, rewards, feedback).
         algo_out = algo.process_rollouts(
             prompt_ids=prompt_ids,
             completion_ids=completion_ids,
@@ -535,19 +572,26 @@ class GRPOPipeline:
             rewards=rewards,
             feedback=[(s.error or "") for s in scores],
         )
+
+        # Backprop on this problem group; scale loss so all problems contribute evenly per batch step.
         bp = train_model.backward(
             messages=[base_messages] * len(completions),
             completion_texts=completions,
             loss_fn=algo_out.loss_fn,
             loss_scale=1.0 / max(1, n_problems),
         )
+
+        # Merge algo stats with backward stats under bp_* keys.
         return {**algo_out.stats, **{f"bp_{k}": float(v) for k, v in bp.items()}}
 
     # ------------------------------------------------------------------
     # SFT gradient step on teacher-corrected completions
     # ------------------------------------------------------------------
 
+    # TODO: SFT Loss is coming high in tests, find why
     def _sft_step(self, *, refined: list[dict], train_model) -> float:
+        
+        # Batch SFT loss: token-level NLL averaged per sample, then across the batch.
         def _sft_loss_batch(
             batch_log_probs: Tensor,
             batch_mask: Tensor,
@@ -557,17 +601,22 @@ class GRPOPipeline:
             lengths = mask.sum(dim=1).clamp(min=1.0)
             return (-((batch_log_probs * mask).sum(dim=1) / lengths)).mean()
 
+        # Single-sample fallback loss used by backends that call per-generation loss.
         def _sft_loss(log_probs: Tensor, gen_idx: int, hidden_comp=None) -> Tensor:
             return -log_probs.mean()
 
+        # Expose the batched loss so train_model.backward can use the more efficient path.
         setattr(_sft_loss, "loss_fn_batch", _sft_loss_batch)
 
+        # Supervise on teacher-corrected completions and normalize by number of refined samples.
         bp = train_model.backward(
             messages=[r["messages"] for r in refined],
             completion_texts=[r["text"] for r in refined],
             loss_fn=_sft_loss,
             loss_scale=1.0 / max(1, len(refined)),
         )
+
+        # Return scalar SFT loss for logging.
         return float(bp.get("loss", 0.0))
 
     # ------------------------------------------------------------------
@@ -581,14 +630,16 @@ class GRPOPipeline:
         score_fn,
         teacher_client,
     ) -> tuple[list[dict], int, int]:
+        # Limit concurrent teacher calls to avoid overloading the inference endpoint.
         cfg = self.cfg
         sem = asyncio.Semaphore(max(1, cfg.engine_semaphore_limit))
         pbar = tqdm(total=len(candidates) * cfg.max_hint_attempts, desc="teacher-refine", leave=False)
 
-        # import once, not per-iteration
+        # Import once at function scope instead of per candidate/attempt.
         from client.agent import AgentClient
 
         async def _refine_one(rec: dict) -> tuple[dict, int, int]:
+            # Start from the current best candidate output and improve it iteratively with hints.
             problem = rec["problem"]
             best_text = str(rec["text"])
             best_score = rec["score"]
@@ -597,6 +648,7 @@ class GRPOPipeline:
             local_hints = 0
             local_passed = 0
 
+            # Try up to max_hint_attempts; stop early once the candidate fully passes.
             for attempt_idx in range(cfg.max_hint_attempts):
                 _status = "did not compile" if not best_score.compiled else (
                     f"compiled, passed {best_score.passed}/{best_score.total} tests"
@@ -604,6 +656,8 @@ class GRPOPipeline:
                 _details = ""
                 if best_score.details:
                     _details = f"\nTest details:\n{best_score.details}"
+
+                # Build a compact tutoring prompt from problem statement + current failure signal.
                 teacher_prompt = (
                     "You are a coding tutor. Give a targeted hint only. "
                     "Do NOT explicitly provide the right answer.\n\n"
@@ -624,7 +678,10 @@ class GRPOPipeline:
                         f"{ref_answer}"
                     )
 
-                # fresh client per candidate — no shared history across coroutines
+                # NOTE: This currently creates a fresh client per attempt (inside retry loop),
+                # so any AgentClient internal conversation history does not carry across attempts.
+                # TODO: Confirm desired behavior for AgentClient history; if iterative memory
+                # is useful, create one local_teacher per candidate and reuse across attempts.
                 local_teacher = AgentClient(
                     base_url=teacher_client.llm.openai_api_base,
                     api_key=teacher_client.llm.openai_api_key,
@@ -637,6 +694,7 @@ class GRPOPipeline:
                     extra_body=self.profile.teacher_extra_body,
                 )
 
+                # Ask teacher for one hint, then run a new student attempt with that hint.
                 async with sem:
                     _, teacher_out = await local_teacher.run(prompt=teacher_prompt)
                 local_hints += 1
@@ -653,17 +711,22 @@ class GRPOPipeline:
                 retry_txt = await generate_fn(retry_messages)
                 pbar.update(1)
 
+                # Re-score the retried answer and down-weight hint-assisted rewards.
                 retry_sc, retry_reward, retry_passed = await score_fn(problem, retry_txt)
                 retry_reward *= cfg.hint_reward_discount
 
+                # Keep whichever attempt has the best reward so far.
                 if retry_reward > best_reward:
                     best_text, best_score, best_reward = retry_txt, retry_sc, retry_reward
+
+                # Early exit once fully solved; consume remaining progress-bar slots for this record.
                 if retry_passed:
                     local_passed += 1
                     solved = True
                     pbar.update(cfg.max_hint_attempts - attempt_idx - 1)
                     break
 
+            # Return the best refined sample plus per-candidate hint/pass counters.
             return dict(
                 problem=problem,
                 messages=[
@@ -676,10 +739,12 @@ class GRPOPipeline:
                 passed=solved,
             ), local_hints, local_passed
 
+        # Run refinement for all candidates concurrently (bounded by semaphore inside each task).
         tasks = [_refine_one(rec) for rec in candidates]
         results = await asyncio.gather(*tasks)
         pbar.close()
 
+        # Aggregate outputs and counters across all refined candidates.
         refined = []
         hints_given = 0
         passed_after_hint = 0
@@ -696,10 +761,13 @@ class GRPOPipeline:
 
     async def _ensure_adapters(self, engine, train_model, cfg: TrainConfig) -> None:
         """Run once on first call. Load initial adapter if provided."""
+
+        # Guard so adapter initialization is performed only once per pipeline instance.
         if self._adapters_initialized:
             return
         self._adapters_initialized = True
 
+        # Optionally bootstrap student adapter into vLLM for rollout-time generation.
         if cfg.student_adapter_path:
             student_path = Path(cfg.student_adapter_path)
             if student_path.exists():
@@ -712,6 +780,7 @@ class GRPOPipeline:
         else:
             print(f"[lora-init] no initial adapter, starting with fresh LoRA")
 
+        # Optionally load a frozen reference adapter used for KL/reference log-prob paths.
         if cfg.ref_adapter_path:
             ref_path = Path(cfg.ref_adapter_path)
             if not ref_path.exists():
@@ -721,10 +790,13 @@ class GRPOPipeline:
 
     def _build_failed_cache(self, current: list[dict]) -> list[dict]:
         """Collect failed rollouts; attach best peer solution for next step's teacher."""
+        
+        # Group rollouts by problem identity so peer hints are computed intra-problem.
         by_problem: dict[int, list[dict]] = {}
         for r in current:
             by_problem.setdefault(id(r["problem"]), []).append(r)
 
+        # For each problem, attach the best passing peer (if any) to every failed rollout.
         cache: list[dict] = []
         for rows in by_problem.values():
             passed = [r for r in rows if r["passed"]]
@@ -735,6 +807,7 @@ class GRPOPipeline:
                         problem=r["problem"], text=r["text"],
                         score=r["score"], reward=r["reward"], peer_solution=peer,
                     ))
+
         return cache
 
     def _build_stats(
@@ -747,6 +820,8 @@ class GRPOPipeline:
         passed_after_hint: int,
         sft_loss: float,
     ) -> dict:
+        
+        # Core counters for logging/monitoring at step granularity.
         out: dict = {
             "n_problems": float(len(batch)),
             "n_current_rollouts": float(len(current)),
@@ -757,16 +832,19 @@ class GRPOPipeline:
             "sft_loss": float(sft_loss),
         }
 
+        # Average GRPO/backward stats across per-problem updates in this batch.
         if grpo_stats:
             for k in set().union(*[s.keys() for s in grpo_stats]):
                 vals = [float(s[k]) for s in grpo_stats if k in s]
                 if vals:
                     out[f"grpo_{k}"] = sum(vals) / len(vals)
 
+        # Combined pass rate considers both original rollouts and teacher-refined outputs.
         all_entries = current + refined
         if all_entries:
             out["combined_pass_rate"] = sum(1 for r in all_entries if r["passed"]) / len(all_entries)
 
+        # For per-problem reporting, keep the best rollout score from current rollouts.
         def _best_score(pid: str) -> Score:
             rows = [r for r in current if str(r["problem"].id) == pid]
             if not rows:
@@ -777,6 +855,7 @@ class GRPOPipeline:
                 if r["score"].total > 0 else 0.0,
             )["score"]
 
+        # Preserve problem order from the sampled batch for downstream consumers.
         out["problem_ids"] = [str(p.id) for p in batch]
         out["problem_scores"] = [_best_score(str(p.id)) for p in batch]
         return out

@@ -6,7 +6,7 @@ import zlib
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-from ..base import Problem
+from ..base import Problem, BaseDataset
 
 
 BUCKET_RANGES = [
@@ -50,7 +50,7 @@ def _ngrams(text: str, n: int = 8) -> Set[Tuple[str, ...]]:
     return {tuple(words[i:i + n]) for i in range(len(words) - n + 1)}
 
 
-class CodeforcesDataset:
+class CodeforcesDataset(BaseDataset):
     def __init__(
         self,
         data_dir: str,

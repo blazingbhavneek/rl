@@ -6,6 +6,17 @@ from .base import ProblemState
 
 
 class BucketDistribution:
+
+    # What this does:
+    # - Set up the bucket distribution used by the curriculum.
+    #
+    # Parameter meanings:
+    # - n_buckets: how many difficulty buckets exist in total.
+    # - initial_mean: starting center bucket for sampling; clamped to valid range.
+    # - std: how wide sampling spreads around the center.
+    # - shift_success_ratio: required mastered/evaluated ratio to move harder.
+    # - exhaustion_ratio: required solved ratio in the last bucket to stop.
+    # - exhaustion_threshold: per-problem solve rate to count as solved at the end.
     def __init__(
         self,
         n_buckets: int,
@@ -24,6 +35,15 @@ class BucketDistribution:
         self.exhaustion_ratio = float(exhaustion_ratio)
         self.exhaustion_threshold = float(exhaustion_threshold)
 
+    # What this does:
+    # - Return sampling probability for each bucket.
+    #
+    # Parameter meanings:
+    # - Uses self.mean and self.std set in the class state.
+    #
+    # Behavior:
+    # - If std <= 0, sampling is fixed to one bucket (round(mean)).
+    # - Otherwise, use a Gaussian-like shape around mean and normalize.
     def get_probs(self) -> List[float]:
         if self.std <= 0:
             idx = int(round(self.mean))
@@ -38,9 +58,31 @@ class BucketDistribution:
             return [1.0 / self.n_buckets] * self.n_buckets
         return [w / s for w in weights]
 
+    # What this does:
+    # - Move curriculum center to harder buckets.
+    #
+    # Parameter meanings:
+    # - delta: amount to move mean to the right.
+    #
+    # Notes:
+    # - Mean is capped at the last bucket index.
     def shift_right(self, delta: float) -> None:
         self.mean = min(self.n_buckets - 1, self.mean + float(delta))
 
+    # What this does:
+    # - Decide if we should shift to harder buckets now.
+    #
+    # Parameter meanings:
+    # - states: all tracked problem states.
+    # - window: active bucket range (lo, hi), inclusive.
+    # - threshold: min solve_rate to consider a problem mastered.
+    # - consecutive_required: min consecutive solves for mastery.
+    # - min_evaluated: minimum attempted problems before deciding to shift.
+    #
+    # Logic:
+    # - Look at non-promoted, attempted problems inside the window.
+    # - If evaluated count is too small, do not shift.
+    # - Shift only if mastered/evaluated >= shift_success_ratio.
     def should_shift(
         self,
         states: Iterable[ProblemState],
@@ -64,6 +106,17 @@ class BucketDistribution:
         ]
         return (len(mastered) / evaluated) >= self.shift_success_ratio
 
+    # What this does:
+    # - Check if curriculum is finished.
+    #
+    # Parameter meanings:
+    # - states: all tracked problem states.
+    #
+    # Logic:
+    # - First ensure the current distribution is centered on last bucket.
+    # - In last bucket, count problem as solved if:
+    #   promoted is True, or solve_rate >= exhaustion_threshold.
+    # - If solved ratio reaches exhaustion_ratio, return True.
     def is_exhausted(self, states: Iterable[ProblemState]) -> bool:
         probs = self.get_probs()
         mode = max(range(self.n_buckets), key=lambda i: probs[i])
@@ -80,6 +133,14 @@ class BucketDistribution:
                 solved += 1
         return (solved / len(right_states)) >= self.exhaustion_ratio
 
+    # What this does:
+    # - Save current distribution settings into a dict.
+    #
+    # Parameter meanings:
+    # - No input parameters.
+    #
+    # Return:
+    # - A JSON-serializable dict used for checkpoints.
     def export(self) -> Dict:
         return {
             "n_buckets": self.n_buckets,
@@ -90,6 +151,11 @@ class BucketDistribution:
             "exhaustion_threshold": self.exhaustion_threshold,
         }
 
+    # What this does:
+    # - Load distribution settings from a dict (usually checkpoint data).
+    #
+    # Parameter meanings:
+    # - state: dict containing bucket count, mean, std, and threshold values.
     def load(self, state: Dict) -> None:
         self.n_buckets = int(state["n_buckets"])
         self.mean = float(state["mean"])

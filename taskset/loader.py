@@ -10,8 +10,33 @@ from .curriculum import BucketDistribution
 from .stats import StatsWriter
 from .codeforces.dataset import CodeforcesDataset
 
-
+# What this class does:
+# - Controls curriculum sampling, state updates, checkpointing, and stop logic.
+# - It picks problems from buckets, tracks solve progress, and shifts harder over time.
+#
+# Main idea:
+# - sample() chooses problems to train on.
+# - update() records outcomes and updates progress metrics.
+# - should_stop() tells the training loop when to end.
 class CurriculumLoader:
+
+    # What this does:
+    # - Build the loader and all runtime state it needs.
+    #
+    # Parameter meanings:
+    # - dataset_dir: folder with dataset files (used by default Codeforces dataset).
+    # - x: number of problems to sample each step.
+    # - solve_threshold: score ratio needed to count as solved.
+    # - consecutive_required: how many solves in a row count for mastery.
+    # - max_steps: hard limit for training steps.
+    # - distribution: bucket distribution object (mean/std and shift rules).
+    # - min_evaluated: minimum window size before shift decision is allowed.
+    # - shift_delta: how far to move mean right when shifting.
+    # - shift_window_radius: active window radius around distribution mean.
+    # - rolling_window: size of per-problem solve history window.
+    # - require_full_bucket_coverage: if True, all tasks in window must be seen before shift.
+    # - dataset: optional custom dataset object; defaults to CodeforcesDataset.
+    # - checkpoint_dir: optional override path for checkpoint files.
     def __init__(
         self,
         dataset_dir: str,
@@ -25,6 +50,8 @@ class CurriculumLoader:
         shift_window_radius: int = 0,
         rolling_window: int = 20,
         require_full_bucket_coverage: bool = True,
+        dataset=None,
+        checkpoint_dir: Optional[str] = None,
     ) -> None:
         self.dataset_dir = Path(dataset_dir)
         self.x = int(x)
@@ -38,13 +65,13 @@ class CurriculumLoader:
         self.rolling_window = int(rolling_window)
         self.require_full_bucket_coverage = bool(require_full_bucket_coverage)
 
-        self.dataset = CodeforcesDataset(data_dir=str(self.dataset_dir))
+        self.dataset = dataset if dataset is not None else CodeforcesDataset(data_dir=str(self.dataset_dir))
         if self.distribution.n_buckets != self.dataset.n_buckets():
             raise ValueError(
                 f"distribution n_buckets ({self.distribution.n_buckets}) != dataset n_buckets ({self.dataset.n_buckets()})"
             )
 
-        self.checkpoint_dir = self.dataset_dir.parent / "checkpoint"
+        self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir is not None else self.dataset_dir.parent / "checkpoint"
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoint_path = self.checkpoint_dir / "problem_states.json"
 
@@ -56,12 +83,26 @@ class CurriculumLoader:
 
         self.load_checkpoint()
 
+    # What this does:
+    # - Return the current active bucket window around distribution mean.
+    #
+    # Parameter meanings:
+    # - No input parameters.
+    #
+    # Return:
+    # - (lo, hi) inclusive bucket bounds.
     def _window(self) -> Tuple[int, int]:
         center = int(round(self.distribution.mean))
         lo = max(0, center - self.shift_window_radius)
         hi = min(self.distribution.n_buckets - 1, center + self.shift_window_radius)
         return lo, hi
 
+    # What this does:
+    # - Ensure a ProblemState exists for a sampled problem and return it.
+    #
+    # Parameter meanings:
+    # - p: sampled problem.
+    # - step: current training step (stored as last sampled step).
     def _get_or_create_state(self, p: Problem, step: int) -> ProblemState:
         if p.id not in self.problem_states:
             self.problem_states[p.id] = ProblemState(
@@ -72,6 +113,14 @@ class CurriculumLoader:
             self._history[p.id] = deque(maxlen=self.rolling_window)
         return self.problem_states[p.id]
 
+    # What this does:
+    # - List candidate problems in one bucket that are still eligible.
+    #
+    # Parameter meanings:
+    # - bucket_idx: bucket index to inspect.
+    #
+    # Eligibility rule:
+    # - Keep problems with no state yet, or not promoted yet.
     def _eligible_in_bucket(self, bucket_idx: int) -> List[Problem]:
         bucket = self.dataset.get_bucket(bucket_idx)
         out = []
@@ -81,13 +130,16 @@ class CurriculumLoader:
                 out.append(p)
         return out
 
+    # What this does:
+    # - Pick one problem from a bucket in a fair way.
+    #
+    # Parameter meanings:
+    # - bucket_idx: bucket index to sample from.
+    #
+    # Fairness rule:
+    # - Pick uniformly among the least-sampled eligible problems.
+    # - This helps cover unseen tasks before repeating heavily seen ones.
     def _fair_pick_in_bucket(self, bucket_idx: int) -> Optional[Problem]:
-        """
-        Fairness policy inside a bucket:
-        pick uniformly among the least-sampled problems.
-        This guarantees unsampled tasks are consumed before repeated sampling,
-        and keeps per-bucket exposure approximately equal over time.
-        """
         candidates = self._eligible_in_bucket(bucket_idx)
         if not candidates:
             return None
@@ -103,6 +155,16 @@ class CurriculumLoader:
                 least_sampled.append(p)
         return random.choice(least_sampled)
 
+    # What this does:
+    # - Sample a single problem using distribution bucket weights.
+    #
+    # Parameter meanings:
+    # - No input parameters.
+    #
+    # Behavior:
+    # - First pick a bucket using distribution probabilities.
+    # - If no candidate there, search nearby buckets left/right by distance.
+    # - Return None if no eligible problem exists in any bucket.
     def _resolve_bucket_sample(self) -> Optional[Problem]:
         probs = self.distribution.get_probs()
         bucket_idx = random.choices(range(len(probs)), weights=probs, k=1)[0]
@@ -124,6 +186,17 @@ class CurriculumLoader:
                     return c
         return None
 
+    # What this does:
+    # - Mark mastered problems in current window as promoted.
+    #
+    # Parameter meanings:
+    # - No input parameters.
+    #
+    # Mastery rule:
+    # - solve_rate >= solve_threshold and consecutive_solves >= consecutive_required.
+    #
+    # Return:
+    # - Number of newly promoted problems.
     def _promote_mastered(self) -> int:
         lo, hi = self._window()
         promoted = 0
@@ -137,11 +210,15 @@ class CurriculumLoader:
                 promoted += 1
         return promoted
 
+    # What this does:
+    # - Check if every problem in active window has been sampled at least once.
+    #
+    # Parameter meanings:
+    # - No input parameters.
+    #
+    # Return:
+    # - True when coverage is complete for all non-empty buckets in window.
     def _window_fully_covered(self) -> bool:
-        """
-        Coverage gate: all problems in the active curriculum window must be
-        sampled at least once before the distribution can shift right.
-        """
         lo, hi = self._window()
         for bucket_idx in range(lo, hi + 1):
             problems = self.dataset.get_bucket(bucket_idx)
@@ -153,6 +230,19 @@ class CurriculumLoader:
                     return False
         return True
 
+    # What this does:
+    # - Decide whether to shift curriculum right, and do it if allowed.
+    #
+    # Parameter meanings:
+    # - No input parameters.
+    #
+    # Behavior:
+    # - Uses distribution.should_shift(...) on current states/window.
+    # - Optionally requires full window coverage before shifting.
+    # - Promotes mastered problems, shifts mean by shift_delta, and may set stop flag.
+    #
+    # Return:
+    # - Number of problems promoted in this call.
     def _maybe_shift(self) -> int:
         promoted = 0
         if self.distribution.should_shift(
@@ -165,12 +255,23 @@ class CurriculumLoader:
             (not self.require_full_bucket_coverage) or self._window_fully_covered()
         ):
             promoted = self._promote_mastered()
-            old_mean = self.distribution.mean
             self.distribution.shift_right(self.shift_delta)
             if self.distribution.is_exhausted(self.problem_states.values()):
                 self._stop_exhausted = True
         return promoted
 
+    # What this does:
+    # - Sample up to x problems for the current step.
+    #
+    # Parameter meanings:
+    # - step: current training step.
+    #
+    # Behavior:
+    # - Before each pick, check whether curriculum should shift.
+    # - Stop early if dataset is exhausted.
+    #
+    # Return:
+    # - List of sampled problems (size <= x).
     def sample(self, step: int) -> List[Problem]:
         sampled = []
         for _ in range(self.x):
@@ -184,6 +285,18 @@ class CurriculumLoader:
             sampled.append(p)
         return sampled
 
+    # What this does:
+    # - Update tracked problem states using verifier scores for one step.
+    #
+    # Parameter meanings:
+    # - problem_ids: ids that were evaluated this step.
+    # - scores: verifier outputs aligned with problem_ids by position.
+    # - step: current training step.
+    #
+    # Behavior:
+    # - Updates attempts, rolling solve rate, consecutive solves, and timestamps.
+    # - May shift curriculum after updates.
+    # - Saves checkpoint and writes step-level stats.
     def update(self, problem_ids: List[str], scores: List[Score], step: int) -> None:
         if len(problem_ids) != len(scores):
             raise ValueError("problem_ids and scores must have equal length")
@@ -233,6 +346,16 @@ class CurriculumLoader:
             total_problems_seen=len(self.problem_states),
         )
 
+    # What this does:
+    # - Tell training loop whether it should stop now.
+    #
+    # Parameter meanings:
+    # - step: current training step.
+    #
+    # Stop conditions:
+    # - step reached max_steps, or
+    # - internal exhausted flag is set, or
+    # - distribution says curriculum is exhausted.
     def should_stop(self, step: int) -> bool:
         if step >= self.max_steps:
             return True
@@ -243,6 +366,11 @@ class CurriculumLoader:
             return True
         return False
 
+    # What this does:
+    # - Save distribution and problem progress state to checkpoint JSON.
+    #
+    # Parameter meanings:
+    # - No input parameters.
     def save_checkpoint(self) -> None:
         data = {
             "distribution": self.distribution.export(),
@@ -254,6 +382,14 @@ class CurriculumLoader:
         with self.checkpoint_path.open("w", encoding="utf-8") as f:
             json.dump(data, f)
 
+    # What this does:
+    # - Load checkpoint JSON if it exists and restore loader state.
+    #
+    # Parameter meanings:
+    # - No input parameters.
+    #
+    # Behavior:
+    # - Restores distribution, problem states, history, and stop flag.
     def load_checkpoint(self) -> None:
         if not self.checkpoint_path.exists():
             return
@@ -277,6 +413,14 @@ class CurriculumLoader:
 
         self._stop_exhausted = bool(data.get("stop_exhausted", False))
 
+    # What this does:
+    # - Return a small snapshot of loader runtime stats.
+    #
+    # Parameter meanings:
+    # - No input parameters.
+    #
+    # Return:
+    # - Dict with state count, current distribution, mean, stop flag, checkpoint path.
     def get_stats(self) -> Dict:
         return {
             "n_states": len(self.problem_states),
