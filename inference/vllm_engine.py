@@ -122,7 +122,22 @@ class VLLMEngine(BaseEngine):
                 server_cmd.extend(["--tool-call-parser", self.tool_call_parser])
             if self.tool_parser_plugin:
                 server_cmd.extend(["--tool-parser-plugin", self.tool_parser_plugin])
+            if bool(self.engine_kwargs.get("enable_lora", False)):
+                server_cmd.append("--enable-lora")
+                max_loras = self.engine_kwargs.get("max_loras")
+                if max_loras is not None:
+                    server_cmd.extend(["--max-loras", str(max_loras)])
+                max_lora_rank = self.engine_kwargs.get("max_lora_rank")
+                if max_lora_rank is not None:
+                    server_cmd.extend(["--max-lora-rank", str(max_lora_rank)])
+                max_cpu_loras = self.engine_kwargs.get("max_cpu_loras")
+                if max_cpu_loras is not None:
+                    server_cmd.extend(["--max-cpu-loras", str(max_cpu_loras)])
+
             server_env = dict(os.environ)
+            if bool(self.engine_kwargs.get("enable_runtime_lora_updating", False)):
+                server_env["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
+                
             server_env["VLLM_SERVER_DEV_MODE"] = "1"
             save_vllm_logs = bool(self.engine_kwargs.get("save_vllm_logs", False))
             if save_vllm_logs:
@@ -207,3 +222,62 @@ class VLLMEngine(BaseEngine):
                 pass
             self.is_awake = False
             self._closed = True
+
+    async def swap_lora_adapter(
+        self,
+        lora_name: str,
+        lora_path: Optional[str] = None,
+        *,
+        load_inplace: bool = True,
+    ) -> dict[str, Any]:
+        if self._closed:
+            raise RuntimeError("engine is shut down")
+        if not lora_name:
+            raise ValueError("lora_name cannot be empty")
+
+        parsed = urllib.parse.urlparse(self.base_url)
+        root_base = f"{parsed.scheme}://{parsed.netloc}"
+        if lora_path:
+            endpoint = "/v1/load_lora_adapter"
+            payload = {
+                "lora_name": lora_name,
+                "lora_path": lora_path,
+                "load_inplace": bool(load_inplace),
+            }
+        else:
+            endpoint = "/v1/unload_lora_adapter"
+            payload = {"lora_name": lora_name}
+
+        data = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(
+            f"{root_base}{endpoint}",
+            data=data,
+            headers=headers,
+            method="POST",
+        )
+
+        def _send() -> dict[str, Any]:
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                raw = resp.read().decode("utf-8")
+                if not raw:
+                    return {}
+                try:
+                    parsed_raw = json.loads(raw)
+                    if isinstance(parsed_raw, dict):
+                        return parsed_raw
+                    return {"result": parsed_raw}
+                except json.JSONDecodeError:
+                    return {"message": raw}
+
+        try:
+            return await asyncio.to_thread(_send)
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8")
+            except Exception:
+                pass
+            raise RuntimeError(f"vLLM server HTTP {exc.code} for {endpoint}: {detail}") from exc

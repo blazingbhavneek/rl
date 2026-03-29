@@ -7,6 +7,7 @@ from pathlib import Path
 
 import torch
 from peft import PeftModel
+from tqdm.asyncio import tqdm as async_tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from inference.vllm_engine import VLLMEngine
@@ -96,7 +97,17 @@ async def _run() -> None:
                 line = line.strip()
                 if not line:
                     continue
-                qa_pairs.append(json.loads(line))
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (
+                    isinstance(row, dict)
+                    and str(row.get("question", "")).strip()
+                    and str(row.get("answer", "")).strip()
+                    and str(row.get("reasoning", "")).strip()
+                ):
+                    qa_pairs.append(row)
     else:
         try:
             print("starting_qa_engine...")
@@ -108,44 +119,78 @@ async def _run() -> None:
 
             async def _run_chunk(i: int) -> tuple[int, list[dict[str, str]]]:
                 async with sem:
-                    rows = await generate_qa_for_chunk_with_lookbehind(
-                        chunks=chunk_texts,
-                        chunk_index=i,
-                        lookbehind_chunks=2,
-                        num_questions=5,
-                        model_path=train_model_path,
-                        port=qa_port,
-                    )
-                    return i, rows
+                    try:
+                        rows = await generate_qa_for_chunk_with_lookbehind(
+                            chunks=chunk_texts,
+                            chunk_index=i,
+                            lookbehind_chunks=2,
+                            num_questions=5,
+                            model_path=train_model_path,
+                            port=qa_port,
+                        )
+                    except Exception:
+                        return i, []
+                    clean_rows = []
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        question = str(row.get("question", "")).strip()
+                        answer = str(row.get("answer", "")).strip()
+                        reasoning = str(row.get("reasoning", "")).strip()
+                        if not (question and answer and reasoning):
+                            continue
+                        clean_rows.append(
+                            {
+                                "question": question,
+                                "answer": answer,
+                                "reasoning": reasoning,
+                            }
+                        )
+                    return i, clean_rows
 
             tasks = [asyncio.create_task(_run_chunk(i)) for i in range(len(chunk_texts))]
-            done = 0
             total = len(tasks)
-            for fut in asyncio.as_completed(tasks):
-                i, rows = await fut
-                qa_pairs.extend(rows)
-                done += 1
-                print(
-                    f"qa_generated_for_chunk: {i + 1}/{len(chunk_texts)} "
-                    f"rows={len(rows)} done={done}/{total}"
-                )
+            qa_pairs_path.parent.mkdir(parents=True, exist_ok=True)
+            with qa_pairs_path.open("w", encoding="utf-8") as f:
+                with async_tqdm(total=total, desc="Generating QA", unit="chunk") as pbar:
+                    for fut in asyncio.as_completed(tasks):
+                        try:
+                            _, rows = await fut
+                        except Exception:
+                            rows = []
+                        for row in rows:
+                            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                        f.flush()
+                        pbar.update(1)
         finally:
             print("shutting_down_qa_engine...")
             await engine.shutdown()
             print("qa_engine_shutdown_complete")
 
+    if not qa_pairs and qa_pairs_path.exists():
+        with qa_pairs_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (
+                    isinstance(row, dict)
+                    and str(row.get("question", "")).strip()
+                    and str(row.get("answer", "")).strip()
+                    and str(row.get("reasoning", "")).strip()
+                ):
+                    qa_pairs.append(row)
+
     if not qa_pairs:
         raise ValueError("No QA pairs could be created from chunks.")
     print(f"chunks_for_qa: {len(chunk_texts)}")
     print(f"qa_pairs_count: {len(qa_pairs)}")
-    if not (qa_pairs_path.exists() and qa_pairs_path.stat().st_size > 0):
-        qa_pairs_path.parent.mkdir(parents=True, exist_ok=True)
-        with qa_pairs_path.open("w", encoding="utf-8") as f:
-            for row in qa_pairs:
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    if qa_pairs_path.exists() and qa_pairs_path.stat().st_size > 0:
         print(f"qa_pairs_file: {qa_pairs_path}")
-    else:
-        print(f"qa_pairs_file_reused: {qa_pairs_path}")
 
     print(f"train_model_path: {train_model_path}")
     print(f"starting_lora_training: epochs={train_epochs}")

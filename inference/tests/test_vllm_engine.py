@@ -1,111 +1,125 @@
 import asyncio
 import json
+from pathlib import Path
 
 from inference.vllm_engine import VLLMEngine
 
+BASE_URL = "http://localhost:8000/v1"
+MODEL = "/media/blazingbhavneek/Common/Code/sglangServer/Infer/Qwen/Qwen3-1.7B"
+LORA_ROOT = (
+    "/media/blazingbhavneek/Common/Code/rl/sft_primer/output/intel/lora/"
+    "media_blazingbhavneek_Common_Code_sglangServer_Infer_Qwen_Qwen3-1.7B"
+)
+LORA_ADAPTERS = [
+    ("intel_sft_epoch_1", f"{LORA_ROOT}/epoch_1"),
+    ("intel_sft_epoch_3", f"{LORA_ROOT}/epoch_3"),
+    # ("intel_sft_final",   f"{LORA_ROOT}/final"),
+]
+LORA_EVAL_PROMPT = "SYCLの簡単な配列初期化サンプルで `constexpr int num` の値はいくつ？数字だけ答えて。"
 
-async def _run_lifecycle(base_url: str, model_name: str) -> None:
+
+async def chat(engine: VLLMEngine, prompt: str, thinking: bool = True) -> tuple[str, str]:
+    resp = await engine._request_json("POST", "/chat/completions", {
+        "model": engine.model_name,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.0,
+        "stream": False,
+        "chat_template_kwargs": {"enable_thinking": thinking},
+    })
+    msg = (resp.get("choices") or [{}])[0].get("message") or {}
+    content = (msg.get("content") or "").strip()
+    reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
+    return content, reasoning
+
+
+async def test_lifecycle(engine: VLLMEngine) -> None:
+    print("\n--- lifecycle ---")
+
+    content, reasoning = await chat(engine, "What is AI? Think carefully first.", thinking=True)
+    print(f"[thinking=on]  reasoning={repr(reasoning[:80])}  content={repr(content[:80])}")
+    assert content or reasoning
+
+    content, _ = await chat(engine, "What is 2+2? One short line.", thinking=False)
+    print(f"[thinking=off] content={repr(content)}")
+    assert content
+
+    print("[lifecycle] ok")
+
+
+async def test_sleep_wake(engine: VLLMEngine) -> None:
+    print("\n--- sleep/wake ---")
+    try:
+        await engine.sleep(level=1)
+        assert await engine.is_sleeping()
+        print("[sleep=1] ok")
+
+        await engine.wake()
+        assert not await engine.is_sleeping()
+        print("[wake] ok")
+
+        await engine.sleep(level=2)
+        assert await engine.is_sleeping()
+        print("[sleep=2] ok")
+
+        await engine.wake()
+    except Exception as exc:
+        print(f"[sleep/wake] not available: {exc}")
+
+
+async def test_lora_swap(engine: VLLMEngine) -> None:
+    print("\n--- lora swap ---")
+    for name, path in LORA_ADAPTERS:
+        assert Path(path).is_dir(), f"adapter not found: {path}"
+
+        await engine.swap_lora_adapter(lora_name=name, lora_path=path)
+        models = await engine._request_json("GET", "/models")
+        ids = [str(r.get("id", "")) for r in (models.get("data") or [])]
+        assert any(name in i for i in ids), f"adapter not visible after load: {name}"
+
+        content, _ = await chat(engine, LORA_EVAL_PROMPT, thinking=False)
+        print(f"[{name}] {repr(content[:80])}")
+        assert content
+
+        await engine.swap_lora_adapter(lora_name=name)
+        models = await engine._request_json("GET", "/models")
+        ids = [str(r.get("id", "")) for r in (models.get("data") or [])]
+        assert not any(name in i for i in ids), f"adapter still loaded after unload: {name}"
+        print(f"[{name}] unloaded ok")
+
+
+async def main() -> None:
     engine = VLLMEngine(
-        model_path=model_name,
+        model_path=MODEL,
         engine_kwargs={
-            "base_url": base_url,
-            "model_name": model_name,
+            "base_url": BASE_URL,
+            "model_name": MODEL,
             "api_key": "EMPTY",
             "save_vllm_logs": True,
             "gpu_memory_utilization": 0.90,
             "reasoning_parser": "qwen3",
             "enable_auto_tool_choice": True,
             "tool_call_parser": "hermes",
+            "enable_lora": True,
+            "enable_runtime_lora_updating": True,
+            "max_loras": 2,
+            "max_lora_rank": 256,
+            "max_cpu_loras": 4,
         },
     )
     try:
         await engine.start()
-        print("engine start: ok")
-
         await engine.init()
-        print("engine init: ok")
+        print("engine ready")
 
-        response = await engine._request_json(
-            "POST",
-            "/chat/completions",
-            {
-                "model": model_name,
-                "messages": [{"role": "user", "content": "What is AI? Think carefully first"}],
-                "temperature": 0.7,
-                "stream": False,
-            },
-        )
-        print("raw chat completion response:")
-        print(json.dumps(response, indent=2, ensure_ascii=False))
-        message = ((response.get("choices") or [{}])[0].get("message") or {})
-        content = (message.get("content") or "").strip()
-        reasoning = message.get("reasoning") or message.get("reasoning_content") or ""
-        print(f"chat completion content: {repr(content)}")
-        print(f"chat completion reasoning: {repr(reasoning)}")
-        assert bool(content) or bool(str(reasoning).strip())
+        await test_lifecycle(engine)
+        await test_lora_swap(engine)
+        await test_sleep_wake(engine)
 
-        response_no_thinking = await engine._request_json(
-            "POST",
-            "/chat/completions",
-            {
-                "model": model_name,
-                "messages": [{"role": "user", "content": "What is 2 + 2? One short line."}],
-                "temperature": 0.0,
-                "stream": False,
-                "chat_template_kwargs": {"enable_thinking": False},
-            },
-        )
-        print("raw chat completion response (enable_thinking=false):")
-        print(json.dumps(response_no_thinking, indent=2, ensure_ascii=False))
-        message_no_thinking = ((response_no_thinking.get("choices") or [{}])[0].get("message") or {})
-        content_no_thinking = (message_no_thinking.get("content") or "").strip()
-        reasoning_no_thinking = (
-            message_no_thinking.get("reasoning") or message_no_thinking.get("reasoning_content") or ""
-        )
-        print(f"content (enable_thinking=false): {repr(content_no_thinking)}")
-        print(f"reasoning (enable_thinking=false): {repr(reasoning_no_thinking)}")
-
-        try:
-            sleeping_before = await engine.is_sleeping()
-            print(f"is_sleeping before sleep: {sleeping_before}")
-
-            await engine.sleep(level=1)
-            sleeping = await engine.is_sleeping()
-            print(f"is_sleeping after sleep: {sleeping}")
-            assert sleeping is True
-
-            await engine.wake()
-            sleeping_after_wake = await engine.is_sleeping()
-            print(f"is_sleeping after wake: {sleeping_after_wake}")
-            assert sleeping_after_wake is False
-
-            await engine.sleep(level=2)
-            sleeping_after_level2 = await engine.is_sleeping()
-            print(f"is_sleeping after sleep(level=2): {sleeping_after_level2}")
-            assert sleeping_after_level2 is True
-            await engine.wake()
-        except Exception as exc:
-            print(f"sleep/wake endpoint not available: {exc}")
-
-        await engine.shutdown()
-        print("engine shutdown: ok")
-
-        print("PASS: vLLM engine lifecycle test")
+        print("\nPASS")
     finally:
-        if not getattr(engine, "_closed", False):
-            await engine.shutdown()
-
-
-async def _run_real_vllm_tests() -> None:
-    base_url = "http://localhost:8000/v1"
-
-    qwen_model = "/media/blazingbhavneek/Common/Code/sglangServer/Infer/Qwen/Qwen3-1.7B"
-    await _run_lifecycle(base_url=base_url, model_name=qwen_model)
-
-    # gpt_oss_model = "/media/blazingbhavneek/Common/Code/sglangServer/Infer/openai/gpt-oss-20b"
-    # await _run_lifecycle(base_url=base_url, model_name=gpt_oss_model)
+        await engine.shutdown()
+        print("engine shutdown")
 
 
 if __name__ == "__main__":
-    asyncio.run(_run_real_vllm_tests())
-    print("PASS: test_vllm_engine")
+    asyncio.run(main())

@@ -56,15 +56,37 @@ class GRPOAlgo(BaseAlgo):
         feedback: Optional[List[str]] = None,
         peer_solution: Optional[str] = None,
     ) -> AlgoOutput:
-        del completion_ids, scores, feedback, peer_solution
+        del completion_ids, feedback, peer_solution
         g = completion_mask.shape[0]
+        if len(scores) != g:
+            raise ValueError(f"scores length ({len(scores)}) must equal G ({g})")
         if len(rewards) != g:
             raise ValueError(f"rewards length ({len(rewards)}) must equal G ({g})")
 
         rewards_t = torch.tensor(rewards, dtype=torch.float32)
         # GRPO uses scalar rollout rewards and converts them to group-relative advantages.
-        # This is the key sparse-signal baseline SDPO is compared against.
-        advantages = self.compute_advantages(rewards_t)
+        # Fallback when rewards collapse (all same): use verifier-derived dense proxy.
+        if rewards_t.numel() > 0 and torch.isclose(
+            rewards_t.std(unbiased=False),
+            torch.zeros((), dtype=rewards_t.dtype),
+            atol=1e-8,
+        ):
+            dense = []
+            for sc in scores:
+                ratio = (float(sc.passed) / float(sc.total)) if sc.total > 0 else 0.0
+                dense.append(ratio + (0.1 if bool(sc.compiled) else 0.0))
+            dense_t = torch.tensor(dense, dtype=torch.float32)
+            advantages = self.compute_advantages(dense_t)
+            if torch.isclose(
+                advantages.std(unbiased=False),
+                torch.zeros((), dtype=advantages.dtype),
+                atol=1e-8,
+            ):
+                # Last-resort tiny rank-centered signal to avoid all-zero no-op steps.
+                idx = torch.arange(g, dtype=torch.float32)
+                advantages = normalize_advantages(idx)
+        else:
+            advantages = self.compute_advantages(rewards_t)
 
         self._ref_logprobs = None
         self._old_logprobs = None
@@ -121,4 +143,38 @@ class GRPOAlgo(BaseAlgo):
                 kl_term = compute_kl_penalty(log_probs.detach(), ref_lp, g_mask).to(log_probs.dtype)
             return pg_term + (self.config.kl_coeff * kl_term)
 
+        def loss_fn_batch(
+            batch_log_probs: Tensor,
+            batch_mask: Tensor,
+            hidden_comp: Optional[Tensor] = None,
+        ) -> Tensor:
+            del hidden_comp
+            device = batch_log_probs.device
+            mask = batch_mask.to(device, non_blocking=True).float()
+            adv = advantages.to(device, non_blocking=True).view(-1, 1)
+            lengths = mask.sum(dim=1).clamp(min=1.0)
+
+            if self._old_logprobs is not None:
+                old_lp = self._old_logprobs.to(device, non_blocking=True)
+                ratio = torch.exp(batch_log_probs - old_lp)
+                adv_full = adv.expand_as(ratio)
+                clipped_ratio = apply_ppo_clip(
+                    ratio=ratio,
+                    advantage=adv_full,
+                    clip_low=self.config.clip_ratio_low,
+                    clip_high=self.config.clip_ratio_high,
+                )
+                surrogate = torch.minimum(ratio * adv_full, clipped_ratio * adv_full)
+                pg_term = -((surrogate * mask).sum(dim=1) / lengths)
+            else:
+                pg_term = -((adv * batch_log_probs * mask).sum(dim=1) / lengths)
+
+            total = pg_term
+            if self._ref_logprobs is not None:
+                ref_lp = self._ref_logprobs.to(device, non_blocking=True)
+                kl = ((batch_log_probs.detach() - ref_lp) * mask).sum(dim=1) / lengths
+                total = total + (float(self.config.kl_coeff) * kl)
+            return total.mean()
+
+        setattr(loss_fn, "loss_fn_batch", loss_fn_batch)
         return loss_fn

@@ -265,3 +265,29 @@ class BaseModel:
             "batch_size": float(num_generations),
             "valid_tokens": float(completion_mask.sum().item()),
         }
+
+    def load_lora_adapter(
+        self,
+        adapter_name: str,
+        adapter_path: str,
+        *,
+        is_trainable: bool = False,
+    ) -> None:
+        if not adapter_name:
+            raise ValueError("adapter_name cannot be empty")
+        if not adapter_path:
+            raise ValueError("adapter_path cannot be empty")
+        if not hasattr(self.model, "load_adapter"):
+            raise RuntimeError("model does not support LoRA adapter loading")
+        self.model.load_adapter(
+            adapter_path,
+            adapter_name=adapter_name,
+            is_trainable=bool(is_trainable),
+        )
+
+    def set_active_lora_adapter(self, adapter_name: str) -> None:
+        if not adapter_name:
+            raise ValueError("adapter_name cannot be empty")
+        if not hasattr(self.model, "set_adapter"):
+            raise RuntimeError("model does not support LoRA adapter switching")
+        self.model.set_adapter(adapter_name)
