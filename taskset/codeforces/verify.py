@@ -48,6 +48,7 @@ def _run_one_test(exe_path: str, test_case: Dict, timeout: float) -> Tuple[bool,
             capture_output=True,
             text=True,
             timeout=timeout,
+            errors="replace",
         )
     except subprocess.TimeoutExpired:
         return False, f"timed out after {timeout}s", timeout
