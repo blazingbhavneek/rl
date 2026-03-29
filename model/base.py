@@ -291,3 +291,11 @@ class BaseModel:
         if not hasattr(self.model, "set_adapter"):
             raise RuntimeError("model does not support LoRA adapter switching")
         self.model.set_adapter(adapter_name)
+
+    def save_lora_adapter(self, adapter_name: str, save_path: str) -> None:
+        if not hasattr(self.model, "set_adapter"):
+            raise RuntimeError("Model is not a PEFT model")
+        
+        # ensure we are saving the correct adapter
+        self.model.set_adapter(adapter_name)
+        self.model.save_pretrained(save_path, selected_adapters=[adapter_name])

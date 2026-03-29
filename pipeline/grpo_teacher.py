@@ -302,13 +302,32 @@ class GRPOPipeline:
                     adapter_save_path = str(
                         Path(cfg.student_adapter_path) / f"step_{step}"
                     )
+                    
+                    # Save from training model
                     train_model.save_lora_adapter(
                         cfg.student_adapter_name, adapter_save_path
                     )
-                    await engine.swap_lora_adapter(
+                    print(f"[lora-save] ✓ saved {cfg.student_adapter_name} to {adapter_save_path}")
+                    
+                    # Hot-swap into vLLM
+                    swap_result = await engine.swap_lora_adapter(
                         cfg.student_adapter_name, adapter_save_path
                     )
-                    print(f"[lora-swap] pushed step={step} weights into vLLM")
+                    print(f"[lora-swap] ✓ hot-swapped into vLLM for step={step}")
+                    
+                    # Verify it's active
+                    try:
+                        models = await engine._request_json("GET", "/models")
+                        active_adapters = [
+                            m.get("id", "") for m in models.get("data", [])
+                            if cfg.student_adapter_name in str(m.get("id", ""))
+                        ]
+                        if active_adapters:
+                            print(f"[lora-verify] ✓ vLLM reports active: {active_adapters}")
+                        else:
+                            print(f"[lora-verify] ⚠ adapter not visible in /models endpoint")
+                    except Exception as e:
+                        print(f"[lora-verify] ! verification failed: {e}")
 
                 print(
                     f"step={step} "
@@ -444,9 +463,11 @@ class GRPOPipeline:
             ))
         print(f"[grpo-backprop] completed={len(grpo_stats)}/{len(batch)}")
 
-        # ── phase 3b: SFT backprop (solved teacher fixes only) ────────
+        # ── phase 3b: SFT backprop (ONLY if teacher solved it) ────────
         sft_loss = 0.0
-        sft_candidates = [r for r in refined if r["passed"]]
+        # Filter: Only train on completions that actually passed all tests
+        sft_candidates = [r for r in refined if r["passed"]] 
+        
         if sft_candidates:
             sft_loss = self._sft_step(
                 refined=sft_candidates,
