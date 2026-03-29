@@ -167,6 +167,8 @@ class GRPOPipeline:
         self.cfg = config
         self.profile = _get_profile(config.model_type)
         self._prev_failed_rollouts: list[dict] = []
+        self._adapters_initialized = False
+        self._lora_in_vllm = False  # True after first swap
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -298,15 +300,16 @@ class GRPOPipeline:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-                # push updated LoRA weights into vLLM
+                # save + swap LoRA into vLLM
                 adapter_save_path = str(Path(cfg.run_dir) / "student_lora" / f"step_{step}")
                 Path(adapter_save_path).mkdir(parents=True, exist_ok=True)
 
                 train_model.save_lora_adapter(cfg.student_adapter_name, adapter_save_path)
-                print(f"[lora-save] saved {cfg.student_adapter_name} → {adapter_save_path}")
+                print(f"[lora-save] ✓ saved → {adapter_save_path}")
 
                 await engine.swap_lora_adapter(cfg.student_adapter_name, adapter_save_path)
-                print(f"[lora-swap] hot-swapped {cfg.student_adapter_name} into vLLM (step={step})")
+                self._lora_in_vllm = True  # next step's rollouts will use it
+                print(f"[lora-swap] ✓ hot-swapped into vLLM (step={step})")
 
                 print(
                     f"step={step} "
@@ -345,7 +348,6 @@ class GRPOPipeline:
 
         await self._ensure_adapters(engine, train_model, cfg)
 
-        # initialize here so _build_stats always has it in scope
         grpo_stats: list[dict] = []
         refined: list[dict] = []
         hints_given = 0
@@ -354,6 +356,10 @@ class GRPOPipeline:
 
         sem = asyncio.Semaphore(max(1, semaphore_limit))
 
+        # step 0: no adapter in vLLM yet → no lora_name
+        # step 1+: adapter swapped → send lora_name
+        use_lora = self._lora_in_vllm
+
         async def _generate(messages: list[dict]) -> str:
             payload: dict = {
                 "model": cfg.model_path,
@@ -361,8 +367,9 @@ class GRPOPipeline:
                 "temperature": cfg.temperature,
                 "max_tokens": cfg.max_tokens,
                 "stream": False,
-                "lora_name": cfg.student_adapter_name,  # ← always, not gated on adapter_path
             }
+            if use_lora:
+                payload["lora_name"] = cfg.student_adapter_name
             payload.update(profile.gen_extra_payload)
             async with sem:
                 resp = await engine._request_json("POST", "/chat/completions", payload)
@@ -404,21 +411,13 @@ class GRPOPipeline:
             "none":     [],
         }.get(refine_mode, [])
 
-        refined: list[dict] = []
-        hints_given = 0
-        passed_after_hint = 0
-
         if teacher_client is not None and cfg.max_hint_attempts > 0 and refine_candidates:
             refined, hints_given, passed_after_hint = await self._teacher_refine(
                 refine_candidates, _generate, _score, teacher_client
             )
             _log_rollout_stats("teacher-fixes", refined, extra=f"hints={hints_given}")
-            
-            # teacher fix stats
-            n_input_failures = len(refine_candidates)
-            n_fixed = passed_after_hint
-            fix_rate = 100 * n_fixed / n_input_failures if n_input_failures > 0 else 0
-            print(f"[teacher] fixed {n_fixed}/{n_input_failures} ({fix_rate:.1f}%)")
+            n_input = len(refine_candidates)
+            print(f"[teacher] fixed {passed_after_hint}/{n_input} ({100*passed_after_hint/n_input:.1f}%)")
 
         # ── sleep vLLM — all generation done ──────────────────────────
         try:
@@ -429,28 +428,32 @@ class GRPOPipeline:
 
         # ── phase 3a: GRPO backprop ───────────────────────────────────
         device = next(train_model.model.parameters()).device
-        # always activate student adapter — it's always present (created by get_peft_model)
         actual_adapters = list(train_model.model.peft_config.keys())
-        active_name = (
-            cfg.student_adapter_name
-            if cfg.student_adapter_name in actual_adapters
-            else actual_adapters[0]
-        )
+        active_name = cfg.student_adapter_name if cfg.student_adapter_name in actual_adapters else actual_adapters[0]
         train_model.set_active_lora_adapter(active_name)
 
-        # ── phase 3b: SFT backprop (ONLY if teacher solved it) ────────
-        sft_loss = 0.0
-        # Filter: Only train on completions that actually passed all tests
-        sft_candidates = [r for r in refined if r["passed"]] 
-        
-        if sft_candidates:
-            sft_loss = self._sft_step(
-                refined=sft_candidates,
+        for problem in tqdm(batch, desc="grpo-backprop", leave=False):
+            rows = [r for r in current if r["problem"] is problem]
+            if not rows:
+                continue
+            grpo_stats.append(self._grpo_step(
+                rows=rows,
+                algo=algo,
                 train_model=train_model,
-            )
+                tokenizer=tokenizer,
+                device=device,
+                n_problems=len(batch),
+                cfg=cfg,
+            ))
+        print(f"[grpo-backprop] completed={len(grpo_stats)}/{len(batch)}")
+
+        # ── phase 3b: SFT backprop (solved teacher fixes only) ────────
+        sft_candidates = [r for r in refined if r["passed"]]
+        if sft_candidates:
+            sft_loss = self._sft_step(refined=sft_candidates, train_model=train_model)
             print(f"[sft-backprop] samples={len(sft_candidates)} loss={sft_loss:.4f}")
 
-        # ── wake vLLM — ready for optimizer step + next rollouts ──────
+        # ── wake vLLM ─────────────────────────────────────────────────
         try:
             await engine.wake()
             print("[vllm] awake for next step")
@@ -692,60 +695,29 @@ class GRPOPipeline:
     # ------------------------------------------------------------------
 
     async def _ensure_adapters(self, engine, train_model, cfg: TrainConfig) -> None:
-        """
-        Lazy-load LoRA adapters on first call.
-        
-        - student_adapter_path: optional initial adapter (e.g. SFT checkpoint)
-        - If provided and exists → load into train model + vLLM
-        - If None or doesn't exist → train from fresh LoRA (still saves/swaps every step)
-        - ref_adapter_path: optional frozen reference for KL penalty (must exist if provided)
-        """
-        if not hasattr(self, "_loaded_engine_adapters"):
-            self._loaded_engine_adapters: set[str] = set()
-            self._loaded_train_adapters: set[str] = set()
+        """Run once on first call. Load initial adapter if provided."""
+        if self._adapters_initialized:
+            return
+        self._adapters_initialized = True
 
-        # Student adapter: optional resume from checkpoint
         if cfg.student_adapter_path:
             student_path = Path(cfg.student_adapter_path)
-            
             if student_path.exists():
-                # Load into vLLM
-                if cfg.student_adapter_name not in self._loaded_engine_adapters:
-                    print(f"[lora-init] loading initial student adapter into vLLM: {student_path}")
-                    await engine.swap_lora_adapter(cfg.student_adapter_name, str(student_path))
-                    self._loaded_engine_adapters.add(cfg.student_adapter_name)
-                
-                # Load into training model
-                if cfg.student_adapter_name not in self._loaded_train_adapters:
-                    print(f"[lora-init] loading initial student adapter into train model: {student_path}")
-                    train_model.load_lora_adapter(
-                        cfg.student_adapter_name, str(student_path), is_trainable=True
-                    )
-                    self._loaded_train_adapters.add(cfg.student_adapter_name)
-                
-                print(f"[lora-init] ✓ student adapter initialized from {student_path}")
+                print(f"[lora-init] loading SFT checkpoint: {student_path}")
+                await engine.swap_lora_adapter(cfg.student_adapter_name, str(student_path))
+                self._lora_in_vllm = True
+                print(f"[lora-init] ✓ loaded into vLLM")
             else:
-                print(f"[lora-init] ⚠ student_adapter_path set but not found: {student_path}")
-                print(f"[lora-init]   continuing with fresh LoRA (will save to run_dir)")
+                print(f"[lora-init] path not found: {student_path}, starting fresh")
         else:
-            print(f"[lora-init] no initial student adapter provided, starting with fresh LoRA")
+            print(f"[lora-init] no initial adapter, starting with fresh LoRA")
 
-        # Reference adapter: frozen policy for KL penalty (optional but must exist if configured)
         if cfg.ref_adapter_path:
             ref_path = Path(cfg.ref_adapter_path)
-            
             if not ref_path.exists():
-                raise FileNotFoundError(
-                    f"ref_adapter_path configured but does not exist: {ref_path}"
-                )
-            
-            if cfg.ref_adapter_name not in self._loaded_train_adapters:
-                print(f"[lora-init] loading reference adapter (frozen): {ref_path}")
-                train_model.load_lora_adapter(
-                    cfg.ref_adapter_name, str(ref_path), is_trainable=False
-                )
-                self._loaded_train_adapters.add(cfg.ref_adapter_name)
-                print(f"[lora-init] ✓ reference adapter loaded")
+                raise FileNotFoundError(f"ref_adapter_path not found: {ref_path}")
+            train_model.load_lora_adapter(cfg.ref_adapter_name, str(ref_path), is_trainable=False)
+            print(f"[lora-init] ✓ reference adapter loaded from {ref_path}")
 
     def _build_failed_cache(self, current: list[dict]) -> list[dict]:
         """Collect failed rollouts; attach best peer solution for next step's teacher."""
