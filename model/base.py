@@ -293,9 +293,12 @@ class BaseModel:
         self.model.set_adapter(adapter_name)
 
     def save_lora_adapter(self, adapter_name: str, save_path: str) -> None:
-        if not hasattr(self.model, "set_adapter"):
+        if not hasattr(self.model, "peft_config"):
             raise RuntimeError("Model is not a PEFT model")
-        
-        # ensure we are saving the correct adapter
-        self.model.set_adapter(adapter_name)
-        self.model.save_pretrained(save_path, selected_adapters=[adapter_name])
+        actual_adapters = list(self.model.peft_config.keys())
+        if not actual_adapters:
+            raise RuntimeError("No LoRA adapters found in model")
+        # PEFT names the adapter "default" when created via get_peft_model.
+        # Use exact name if it exists, otherwise fall back to first available.
+        save_name = adapter_name if adapter_name in actual_adapters else actual_adapters[0]
+        self.model.save_pretrained(save_path, selected_adapters=[save_name])
