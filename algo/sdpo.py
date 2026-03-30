@@ -242,7 +242,7 @@ class SDPOAlgo(BaseAlgo):
         with torch.inference_mode():
             hidden_prefix, pos_ids = teacher_model._forward_prefix(full_ids, full_mask)
             hidden_suffix = teacher_model._forward_suffix(hidden_prefix, pos_ids, full_mask)
-            hidden_comp = hidden_suffix[:, -completion_len:, :]
+            hidden_comp = hidden_suffix[:, -(completion_len + 1):-1, :]
 
             sampled_lp = teacher_model._token_logprobs_chunked(hidden_comp, completion_ids).detach().float().cpu()
 

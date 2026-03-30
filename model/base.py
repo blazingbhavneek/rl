@@ -226,7 +226,7 @@ class BaseModel:
         # Trainable suffix once.
         hidden_for_suffix = hidden_prefix.clone().detach().requires_grad_(True)
         hidden_suffix = self._forward_suffix(hidden_for_suffix, pos_ids.detach(), full_mask)
-        hidden_comp = hidden_suffix[:, -completion_len:, :]
+        hidden_comp = hidden_suffix[:, -(completion_len + 1):-1, :]
         # hidden_suffix: [G, T_total, H]
         # hidden_comp: [G, T_c, H] (completion slice only)
 
