@@ -26,13 +26,14 @@ MODEL_PATH             = "/media/blazingbhavneek/Common/Code/sglangServer/Infer/
 
 QA_PORT                = 30000
 CHUNK_CONCURRENCY      = 10
-TRAIN_EPOCHS           = 4
-TRAIN_LR               = 1e-5
+TRAIN_EPOCHS           = 15
+TRAIN_LR               = 2e-4
 TRAIN_BATCH_SIZE       = 4
 GRAD_ACCUM_STEPS       = 8
-TRAIN_ON_REASONING     = True
+TRAIN_ON_REASONING     = False
 INFER_MAX_NEW_TOKENS   = 8192
 GPU_MEMORY_UTILIZATION = 0.90
+SAVE_EVERY_STEPS       = 50           # save LoRA every N optimizer steps; 0 = disabled
 
 # ---------------------------------------------------------------------------
 # Hardcoded QA sample — used to sanity-check the pipeline without chunking.
@@ -94,6 +95,68 @@ def _load_qa_pairs(path: Path) -> list[dict]:
     return pairs
 
 
+def _infer(model, tokenizer, question: str, model_family: str) -> str:
+    """Run greedy inference for a single question, return decoded answer text."""
+    messages = [{"role": "user", "content": question}]
+    enable_thinking = model_family in ("qwen3", "qwen3_5")
+    try:
+        prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+        )
+    except TypeError:
+        prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+
+    tok = tokenizer([prompt], return_tensors="pt")
+    device = next(model.parameters()).device
+    input_ids = tok["input_ids"].to(device)
+    attention_mask = tok["attention_mask"].to(device)
+
+    with torch.inference_mode():
+        out = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=INFER_MAX_NEW_TOKENS,
+            do_sample=False,
+        )
+    return tokenizer.decode(out[0, input_ids.shape[1]:], skip_special_tokens=True).strip()
+
+
+def _compare_base_vs_lora(adapter_dir: str) -> None:
+    """Load base model and base+LoRA, run LLVM question on both, print comparison."""
+    model_family = detect_model_family(MODEL_PATH)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+
+    print("loading_base_model...")
+    base_model = AutoModelForCausalLM.from_pretrained(
+        MODEL_PATH,
+        device_map={"": "cuda:0"},
+        torch_dtype=torch.bfloat16,
+    )
+    base_model.eval()
+
+    print("--- base model answer ---")
+    base_answer = _infer(base_model, tokenizer, LLVM_QA_SAMPLE["question"], model_family)
+    print(base_answer)
+
+    print("\nloading_lora_adapter...")
+    lora_model = PeftModel.from_pretrained(base_model, adapter_dir)
+    lora_model.eval()
+
+    print("--- lora model answer ---")
+    lora_answer = _infer(lora_model, tokenizer, LLVM_QA_SAMPLE["question"], model_family)
+    print(lora_answer)
+
+    print("\n--- question ---")
+    print(LLVM_QA_SAMPLE["question"])
+    print("\n--- expected answer ---")
+    print(LLVM_QA_SAMPLE["answer"])
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -113,10 +176,23 @@ async def _run() -> None:
     print(f"train_lr:              {TRAIN_LR}")
     print(f"train_batch_size:      {TRAIN_BATCH_SIZE}")
     print(f"grad_accum_steps:      {GRAD_ACCUM_STEPS}")
+    print(f"save_every_steps:      {SAVE_EVERY_STEPS}")
     print(f"qa_port:               {QA_PORT}")
 
     if not INPUT_FOLDER_PATH.exists() or not INPUT_FOLDER_PATH.is_dir():
         raise FileNotFoundError(f"Input folder not found: {INPUT_FOLDER_PATH}")
+
+    # --- check if final LoRA already exists; if so, skip training and compare ---
+    model_key = (
+        MODEL_PATH.strip("/")
+        .replace("\\", "_").replace("/", "_").replace(":", "_")
+    )
+    final_lora_dir = Path(output_root) / input_folder / "lora" / model_key / "final"
+    if final_lora_dir.exists():
+        print(f"\nfinal_lora_found: {final_lora_dir}")
+        print("skipping_training — running base vs lora comparison instead\n")
+        _compare_base_vs_lora(str(final_lora_dir))
+        return
 
     # --- chunks ---
     out_path = Path(output_root) / input_folder / "chunks.json"
@@ -210,8 +286,6 @@ async def _run() -> None:
     if not qa_pairs:
         raise ValueError("No QA pairs could be created from chunks.")
 
-    # Inject the hardcoded LLVM sample so the pipeline always sees at least
-    # one known-good example regardless of what the QA engine produced.
     qa_pairs.insert(0, LLVM_QA_SAMPLE)
     print(f"qa_pairs_count: {len(qa_pairs)} (includes 1 hardcoded LLVM sample)")
 
@@ -226,52 +300,13 @@ async def _run() -> None:
         train_batch_size=TRAIN_BATCH_SIZE,
         grad_accum_steps=GRAD_ACCUM_STEPS,
         train_on_reasoning=TRAIN_ON_REASONING,
+        save_every_steps=SAVE_EVERY_STEPS,
     )
     print(f"adapter_dir: {adapter_dir}")
 
-    # --- inference: ask the LLVM question to verify the model learned it ---
-    print("loading_base_plus_lora_for_inference...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-    base_model = AutoModelForCausalLM.from_pretrained(
-        MODEL_PATH,
-        device_map={"": "cuda:0"},
-        dtype=torch.bfloat16,
-    )
-    model = PeftModel.from_pretrained(base_model, adapter_dir)
-    model.eval()
-
-    infer_messages = [{"role": "user", "content": LLVM_QA_SAMPLE["question"]}]
-    enable_thinking = model_family in ("qwen3", "qwen3_5")
-    try:
-        prompt = tokenizer.apply_chat_template(
-            infer_messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=enable_thinking,
-        )
-    except TypeError:
-        prompt = tokenizer.apply_chat_template(
-            infer_messages, tokenize=False, add_generation_prompt=True,
-        )
-
-    tok = tokenizer([prompt], return_tensors="pt")
-    device = next(model.parameters()).device
-    input_ids = tok["input_ids"].to(device)
-    attention_mask = tok["attention_mask"].to(device)
-
-    with torch.inference_mode():
-        out = model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=INFER_MAX_NEW_TOKENS,
-            do_sample=False,
-        )
-    text = tokenizer.decode(out[0, input_ids.shape[1]:], skip_special_tokens=True).strip()
-
-    print("\n--- LLVM inference question ---")
-    print(LLVM_QA_SAMPLE["question"])
-    print("\n--- model answer ---")
-    print(text)
+    # --- compare base vs trained LoRA ---
+    print("\nrunning_base_vs_lora_comparison...")
+    _compare_base_vs_lora(adapter_dir)
 
     print("\nPASS: sft_primer chunk + lora train + inference test")
 

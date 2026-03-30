@@ -276,6 +276,7 @@ def train_model_on_qa_pairs(
     seed: int = 42,
     train_batch_size: int = 8,
     train_on_reasoning: bool = True,
+    save_every_steps: int = 0,          # 0 = disabled; N = save every N optimizer steps
 ) -> str:
     if not qa_pairs:
         raise ValueError("qa_pairs is empty.")
@@ -406,6 +407,13 @@ def train_model_on_qa_pairs(
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 step_count += 1
+
+                # --- step-level checkpoint ---
+                if save_every_steps > 0 and step_count % save_every_steps == 0:
+                    step_dir = lora_model_dir / f"step_{step_count}"
+                    step_dir.mkdir(parents=True, exist_ok=True)
+                    trainer.model.save_pretrained(str(step_dir))
+                    print(f"[sft_primer] step_checkpoint saved: {step_dir}", flush=True)
 
             current_lr = scheduler.get_last_lr()[0]
             mean_loss = running_loss / max(1, seen_batches)
