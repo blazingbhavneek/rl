@@ -1,0 +1,9 @@
+{
+    "model": "gpt-4o",
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "YOUR_KEY_HERE",
+
+    "specialist_model": "gpt-4o",
+    "specialist_base_url": "https://api.openai.com/v1",
+    "specialist_api_key": "YOUR_KEY_HERE"
+}
