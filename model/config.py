@@ -10,6 +10,8 @@ class ModelConfig:
     lora_alpha: int = 256
     
     chunk_size: int | None = None
+    token_chunk_size: int | None = None
+    offload_prefix_to_cpu: bool = False
     
     attn_implementation: str = "eager"
     

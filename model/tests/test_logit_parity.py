@@ -3,19 +3,38 @@ import time
 import warnings
 
 import torch
-from transformers import AutoTokenizer
-from transformers.masking_utils import create_causal_mask
 
 from model.config import ModelConfig
-from model.gptoss import GptOssModel
-from model.qwen3 import Qwen3Model
-from model.qwen3_5 import Qwen3_5Model
+from model.gemma4 import Gemma4Model
 
 warnings.filterwarnings(
     "ignore",
     message=r".*Dynamo detected a call to a `functools\.lru_cache`-wrapped function.*",
     category=UserWarning,
 )
+
+DEFAULT_GEMMA4_MODEL_PATH = "/media/blazingbhavneek/Common/Code/sglangServer/Infer/google/gemma-4-E2B-it"
+DEFAULT_GEMMA4_LORA_TARGETS = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+]
+
+
+def _build_test_config(lora_targets: list[str], *, chunk_size: int, use_grad_checkpoint: bool) -> ModelConfig:
+    return ModelConfig(
+        lora=lora_targets,
+        lora_fraction=0.25,
+        lora_rank=128,
+        lora_alpha=256,
+        chunk_size=chunk_size,
+        cuda_device_index=0,
+        use_grad_checkpoint=use_grad_checkpoint,
+    )
 
 
 def run_logit_parity(
@@ -24,13 +43,9 @@ def run_logit_parity(
     t0 = time.perf_counter()
 
     print("[parity] building config")
-    config = ModelConfig(
-        lora=lora_targets,
-        lora_fraction=0.25,
-        lora_rank=128,
-        lora_alpha=256,
+    config = _build_test_config(
+        lora_targets,
         chunk_size=5,
-        cuda_device_index=0,
         use_grad_checkpoint=False,
     )
 
@@ -41,7 +56,7 @@ def run_logit_parity(
     print(f"[parity] custom model loaded in {time.perf_counter() - t_load0:.2f}s")
 
     print("[parity] loading tokenizer")
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    tokenizer = custom_model.tokenizer
 
     print("[parity] building test message batch")
     messages_batch = [
@@ -79,12 +94,6 @@ def run_logit_parity(
     )
 
     split_layer = int(getattr(custom_model, "_prefix_split_layer", 0))
-    base_model = (
-        custom_model.model.base_model.model
-        if hasattr(custom_model.model, "base_model")
-        else custom_model.model
-    )
-    inner = base_model.model if hasattr(base_model, "model") else base_model
     layer_idx = max(0, split_layer - 1)
     print(f"[parity] split_layer={split_layer} hook_layer={layer_idx}")
 
@@ -95,7 +104,7 @@ def run_logit_parity(
             output[0] if isinstance(output, tuple) else output
         ).detach()
 
-    hook = inner.layers[layer_idx].register_forward_hook(_capture_boundary_output)
+    hook = custom_model._layers[layer_idx].register_forward_hook(_capture_boundary_output)
 
     print("[parity] running HF-style forward on loaded model")
     t_hf = time.perf_counter()
@@ -109,7 +118,7 @@ def run_logit_parity(
     print(f"[parity] hf-style forward done in {time.perf_counter() - t_hf:.2f}s")
 
     with torch.inference_mode():
-        custom_prefix_hidden, _ = custom_model._forward_prefix(
+        custom_prefix_hidden, _, _, _ = custom_model._forward_prefix(
             input_ids, attention_mask
         )
 
@@ -172,21 +181,12 @@ def run_logit_parity(
 
 
 if __name__ == "__main__":
-    # run_logit_parity(
-    #     "/media/blazingbhavneek/Common/Code/sglangServer/Infer/openai/gpt-oss-20b",
-    #     GptOssModel,
-    #     ["q_proj", "k_proj", "v_proj", "o_proj"],
-    # )
-    # print("PASS: gpt-oss parity")
-    # gc.collect()
-    # if torch.cuda.is_available():
-    #     torch.cuda.empty_cache()
     run_logit_parity(
-        "/media/blazingbhavneek/Common/Code/sglangServer/Infer/Qwen/Qwen3-1.7B",
-        Qwen3Model,
-        ["gate_proj", "up_proj", "down_proj"],
+        DEFAULT_GEMMA4_MODEL_PATH,
+        Gemma4Model,
+        DEFAULT_GEMMA4_LORA_TARGETS,
     )
-    print("PASS: qwen3 parity")
+    print("PASS: gemma4 parity")
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

@@ -1,13 +1,11 @@
+import os
 import gc
 import warnings
 
 import torch
-from transformers import AutoTokenizer
 
 from model.config import ModelConfig
-from model.gptoss import GptOssModel
-from model.qwen3 import Qwen3Model
-from model.qwen3_5 import Qwen3_5Model
+from model.gemma4 import Gemma4Model
 
 warnings.filterwarnings(
     "ignore",
@@ -15,18 +13,37 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
+DEFAULT_GEMMA4_MODEL_PATH = "/media/blazingbhavneek/Common/Code/sglangServer/Infer/google/gemma-4-E2B-it"
+DEFAULT_GEMMA4_LORA_TARGETS = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+]
+
+
+def _build_test_config(lora_targets: list[str], *, chunk_size: int, use_grad_checkpoint: bool) -> ModelConfig:
+    return ModelConfig(
+        lora=lora_targets,
+        lora_fraction=0.25,
+        lora_rank=128,
+        lora_alpha=256,
+        chunk_size=chunk_size,
+        cuda_device_index=0,
+        use_grad_checkpoint=use_grad_checkpoint,
+    )
+
 
 def run_greedy_generation_parity(
     model_path: str, model_cls: type, lora_targets: list[str], max_new_tokens: int = 10
 ) -> None:
     print("[gen-parity] building config")
-    config = ModelConfig(
-        lora=lora_targets,
-        lora_fraction=0.25,
-        lora_rank=128,
-        lora_alpha=256,
+    config = _build_test_config(
+        lora_targets,
         chunk_size=64,
-        cuda_device_index=0,
         use_grad_checkpoint=False,
     )
 
@@ -35,7 +52,7 @@ def run_greedy_generation_parity(
     model.model.eval()
 
     print("[gen-parity] loading tokenizer")
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    tokenizer = model.tokenizer
 
     messages = [
         [
@@ -64,8 +81,17 @@ def run_greedy_generation_parity(
             hf_ids = torch.cat([hf_ids, hf_next], dim=1)
             hf_mask = torch.cat([hf_mask, torch.ones_like(hf_next)], dim=1)
 
-            prefix_hidden, pos_ids = model._forward_prefix(custom_ids, custom_mask)
-            suffix_hidden = model._forward_suffix(prefix_hidden, pos_ids, custom_mask)
+            prefix_hidden, pos_ids, shared_kv_states, per_layer_inputs = model._forward_prefix(
+                custom_ids,
+                custom_mask,
+            )
+            suffix_hidden = model._forward_suffix(
+                prefix_hidden,
+                pos_ids,
+                custom_mask,
+                shared_kv_states,
+                per_layer_inputs,
+            )
             custom_logits = model._lm_head_logits_chunked(suffix_hidden)
             custom_next = custom_logits[:, -1, :].argmax(dim=-1, keepdim=True)
             custom_ids = torch.cat([custom_ids, custom_next], dim=1)
@@ -91,15 +117,9 @@ def run_greedy_generation_parity(
 
 
 if __name__ == "__main__":
-    # run_greedy_generation_parity(
-    #     "/media/blazingbhavneek/Common/Code/sglangServer/Infer/openai/gpt-oss-20b",
-    #     GptOssModel,
-    #     ["q_proj", "k_proj", "v_proj", "o_proj"],
-    # )
-    # print("PASS: gpt-oss greedy generation parity")
     run_greedy_generation_parity(
-        "/media/blazingbhavneek/Common/Code/sglangServer/Infer/Qwen/Qwen3-1.7B",
-        Qwen3Model,
-        ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        DEFAULT_GEMMA4_MODEL_PATH,
+        Gemma4Model,
+        DEFAULT_GEMMA4_LORA_TARGETS,
     )
-    print("PASS: qwen3 greedy generation parity")
+    print("PASS: gemma4 greedy generation parity")
