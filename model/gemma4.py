@@ -169,7 +169,8 @@ class _StreamGemmaAttention(nn.Module):
         chunk_len = end - start
         cos, sin = position_embeddings
 
-        query_states = self.q_proj(hidden_states).view(batch_size, chunk_len, -1, self.head_dim)
+        query_input = hidden_states if hidden_states.shape[1] == chunk_len else hidden_states[:, start:end, :]
+        query_states = self.q_proj(query_input).view(batch_size, chunk_len, -1, self.head_dim)
         query_states = self.q_norm(query_states)
         query_states = _apply_rotary_pos_emb(
             query_states,
@@ -202,9 +203,24 @@ class _StreamGemmaAttention(nn.Module):
         if self.store_full_length_kv and not self.is_kv_shared_layer and end == seq_len:
             shared_kv_states[self.layer_idx] = (key_states, value_states)
 
+        kv_len = key_states.shape[-2]
         chunk_mask = None
         if attention_mask is not None:
-            chunk_mask = attention_mask[:, :, start:end, :end]
+            if attention_mask.dim() == 2:
+                sliding_window = None
+                if getattr(self, "layer_type", None) == "sliding_attention":
+                    sliding_window = getattr(self.config, "sliding_window", None)
+                chunk_mask = _make_chunk_attention_mask(
+                    attention_mask,
+                    start=start,
+                    end=end,
+                    kv_end=kv_len,
+                    dtype=query_states.dtype,
+                    device=query_states.device,
+                    sliding_window=sliding_window,
+                )
+            else:
+                chunk_mask = attention_mask[:, :, start:end, :kv_len]
 
         attn_output, attn_weights = _stream_attention_forward(
             self,
@@ -359,6 +375,33 @@ def _get_layer_types(inner_model) -> list[str]:
     return ["full_attention"] * len(inner_model.layers)
 
 
+def _make_chunk_attention_mask(
+    raw_attention_mask: torch.Tensor | None,
+    *,
+    start: int,
+    end: int,
+    kv_end: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    sliding_window: int | None = None,
+) -> torch.Tensor | None:
+    q_pos = torch.arange(start, end, device=device).unsqueeze(1)
+    k_pos = torch.arange(0, kv_end, device=device).unsqueeze(0)
+    causal = k_pos <= q_pos
+    if sliding_window is not None:
+        causal = causal & ((q_pos - k_pos) < sliding_window)
+
+    mask = torch.zeros((end - start, kv_end), device=device, dtype=dtype)
+    mask = mask.masked_fill(~causal, torch.finfo(dtype).min)
+    mask = mask.unsqueeze(0).unsqueeze(0)
+
+    if raw_attention_mask is not None:
+        pad = raw_attention_mask[:, :kv_end].to(device=device)
+        pad_mask = (pad == 0).unsqueeze(1).unsqueeze(2)
+        mask = mask.masked_fill(pad_mask, torch.finfo(dtype).min)
+    return mask
+
+
 def _build_mask_mapping(inner_model, hidden_states, attention_mask, position_ids):
     cfg = inner_model.config
     base_kwargs = {
@@ -393,6 +436,38 @@ def _to_normal_tensor(tensor: torch.Tensor | None) -> torch.Tensor | None:
         return None
     with torch.inference_mode(False):
         return tensor.clone().detach()
+
+
+def _build_runtime(
+    inner_model,
+    layer_types: list[str],
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    position_ids: torch.Tensor,
+    *,
+    build_full_masks: bool,
+) -> tuple[dict, dict]:
+    if build_full_masks:
+        mask_mapping = _build_mask_mapping(
+            inner_model,
+            hidden_states.detach(),
+            attention_mask,
+            position_ids,
+        )
+    else:
+        mask_mapping = {
+            layer_type: attention_mask
+            for layer_type in set(layer_types)
+        }
+
+    position_embeddings = {}
+    for layer_type in set(layer_types):
+        position_embeddings[layer_type] = inner_model.rotary_emb(
+            hidden_states.detach(),
+            position_ids,
+            layer_type=layer_type,
+        )
+    return mask_mapping, position_embeddings
 
 
 def _run_layer(
@@ -480,7 +555,7 @@ class Gemma4Model(BaseModel):
                 param.requires_grad_(True)
 
     def _wrap_suffix_layers_for_streaming(self) -> None:
-        for idx in range(self._prefix_split_layer, len(self._layers)):
+        for idx in range(len(self._layers)):
             layer = self._layers[idx]
             if isinstance(layer, _StreamGemmaDecoderLayer):
                 continue
@@ -574,21 +649,17 @@ class Gemma4Model(BaseModel):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
+        *,
+        build_full_masks: bool,
     ) -> tuple[dict, dict]:
-        mask_mapping = _build_mask_mapping(
+        return _build_runtime(
             self._inner_model,
+            self._layer_types,
             hidden_states.detach(),
             attention_mask,
             position_ids,
+            build_full_masks=build_full_masks,
         )
-        position_embeddings = {}
-        for layer_type in set(self._layer_types):
-            position_embeddings[layer_type] = self._inner_model.rotary_emb(
-                hidden_states.detach(),
-                position_ids,
-                layer_type=layer_type,
-            )
-        return mask_mapping, position_embeddings
 
     def _detach_shared_kv_states(
         self,
@@ -724,10 +795,12 @@ class Gemma4Model(BaseModel):
             .expand(batch_size, seq_len)
         )
 
+        use_chunked_prefix = self._token_chunk_size > 0
         mask_mapping, position_embeddings = self._build_runtime(
             hidden_states,
             attention_mask,
             position_ids,
+            build_full_masks=not use_chunked_prefix,
         )
 
         shared_kv_states = {}
@@ -736,16 +809,44 @@ class Gemma4Model(BaseModel):
 
         for idx, layer in enumerate(self._layers[: self._prefix_split_layer]):
             per_layer_input = per_layer_inputs[:, :, idx, :] if per_layer_inputs is not None else None
-            hidden_states = _run_layer(
-                layer,
-                hidden_states,
-                mask_mapping,
-                position_embeddings,
-                position_ids,
-                shared_kv_states,
-                self._layer_types[idx],
-                per_layer_input=per_layer_input,
-            )
+            if use_chunked_prefix and isinstance(layer, _StreamGemmaDecoderLayer):
+                layer.prepare_for_replay(
+                    hidden_states,
+                    position_embeddings[self._layer_types[idx]],
+                    shared_kv_states,
+                )
+                output_chunks = []
+                for start in range(0, seq_len, self._token_chunk_size):
+                    end = min(start + self._token_chunk_size, seq_len)
+                    per_layer_chunk = None
+                    if per_layer_input is not None:
+                        per_layer_chunk = per_layer_input[:, start:end, :]
+                    output_chunks.append(
+                        _run_layer(
+                            layer,
+                            hidden_states,
+                            mask_mapping,
+                            position_embeddings,
+                            position_ids,
+                            shared_kv_states,
+                            self._layer_types[idx],
+                            per_layer_input=per_layer_chunk,
+                            chunk_range=(start, end),
+                        )
+                    )
+                layer.clear_replay_cache()
+                hidden_states = torch.cat(output_chunks, dim=1)
+            else:
+                hidden_states = _run_layer(
+                    layer,
+                    hidden_states,
+                    mask_mapping,
+                    position_embeddings,
+                    position_ids,
+                    shared_kv_states,
+                    self._layer_types[idx],
+                    per_layer_input=per_layer_input,
+                )
 
         return hidden_states, position_ids, shared_kv_states, per_layer_inputs
 
@@ -757,10 +858,12 @@ class Gemma4Model(BaseModel):
         shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]],
         per_layer_inputs: torch.Tensor | None,
     ) -> torch.Tensor:
+        use_streaming_suffix = self._use_grad_checkpoint and torch.is_grad_enabled() and self._token_chunk_size > 0
         mask_mapping, position_embeddings = self._build_runtime(
             hidden_states,
             attention_mask,
             position_ids,
+            build_full_masks=not use_streaming_suffix,
         )
 
         for offset, layer in enumerate(self._layers[self._prefix_split_layer :]):
@@ -826,7 +929,7 @@ class Gemma4Model(BaseModel):
             self_outer = self
             layer_replay = _LayerReplay()
 
-            if self._use_grad_checkpoint and torch.is_grad_enabled() and self._token_chunk_size > 0:
+            if use_streaming_suffix:
                 hidden_states = _StreamCheckpointFunction.apply(
                     layer_replay,
                     self._token_chunk_size,
