@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 import torch
+import torch.nn as nn
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
@@ -16,6 +17,273 @@ class _PrefixBundle:
     position_ids: torch.Tensor
     shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]]
     per_layer_inputs: torch.Tensor | None
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _apply_rotary_pos_emb(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> torch.Tensor:
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    return (x * cos) + (_rotate_half(x) * sin)
+
+
+def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+class _StreamCheckpointFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        run_function: Callable,
+        chunk_size: int,
+        offload_to_cpu: bool,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        ctx.run_function = run_function
+        ctx.chunk_size = max(1, int(chunk_size))
+        saved_hidden = hidden_states.detach()
+        if offload_to_cpu and saved_hidden.device.type != "cpu":
+            saved_hidden = saved_hidden.to("cpu")
+        ctx.save_for_backward(saved_hidden)
+
+        seq_len = hidden_states.shape[1]
+        with torch.no_grad():
+            outputs = []
+            for start in range(0, seq_len, ctx.chunk_size):
+                end = min(start + ctx.chunk_size, seq_len)
+                outputs.append(run_function(hidden_states, chunk_range=(start, end)))
+        return torch.cat(outputs, dim=1)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (hidden_states_saved,) = ctx.saved_tensors
+        hidden_states_detached = hidden_states_saved.to(
+            device=grad_output.device,
+            non_blocking=True,
+        ).detach().requires_grad_(True)
+        seq_len = grad_output.shape[1]
+
+        for start in range(0, seq_len, ctx.chunk_size):
+            end = min(start + ctx.chunk_size, seq_len)
+            with torch.enable_grad():
+                output_chunk = ctx.run_function(
+                    hidden_states_detached,
+                    chunk_range=(start, end),
+                )
+                torch.autograd.backward(
+                    output_chunk,
+                    grad_tensors=grad_output[:, start:end, :].detach(),
+                    retain_graph=False,
+                )
+
+        return None, None, None, hidden_states_detached.grad
+
+
+def _stream_attention_forward(
+    module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    key_states = _repeat_kv(key, module.num_key_value_groups)
+    value_states = _repeat_kv(value, module.num_key_value_groups)
+
+    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * module.scaling
+    softcap = getattr(module.config, "attn_logit_softcapping", None)
+    if softcap is not None:
+        attn_weights = torch.tanh(attn_weights / softcap) * softcap
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
+
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    if module.training and module.attention_dropout:
+        attn_weights = nn.functional.dropout(attn_weights, p=module.attention_dropout, training=True)
+    attn_output = torch.matmul(attn_weights, value_states)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    return attn_output, attn_weights
+
+
+class _StreamGemmaAttention(nn.Module):
+    def __init__(self, base_attn: nn.Module):
+        super().__init__()
+        self.base_attn = base_attn
+
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.base_attn, name)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]],
+        past_key_values=None,
+        chunk_range: tuple[int, int] | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if chunk_range is None:
+            return self.base_attn(
+                hidden_states=hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                shared_kv_states=shared_kv_states,
+                past_key_values=past_key_values,
+                **kwargs,
+            )
+
+        batch_size, seq_len = hidden_states.shape[:2]
+        start, end = chunk_range
+        chunk_len = end - start
+        hidden_shape = (batch_size, -1, self.head_dim)
+        cos, sin = position_embeddings
+
+        query_states = self.q_proj(hidden_states[:, start:end, :]).view(batch_size, chunk_len, -1, self.head_dim)
+        query_states = self.q_norm(query_states)
+        query_states = _apply_rotary_pos_emb(
+            query_states,
+            cos[:, start:end, :],
+            sin[:, start:end, :],
+            unsqueeze_dim=2,
+        ).transpose(1, 2)
+
+        if self.is_kv_shared_layer:
+            key_states, value_states = shared_kv_states[self.kv_shared_layer_index]
+            key_states = key_states.to(query_states.device, non_blocking=True)[:, :, :end, :]
+            value_states = value_states.to(query_states.device, non_blocking=True)[:, :, :end, :]
+        else:
+            kv_hidden = hidden_states[:, :end, :]
+            key_states = self.k_proj(kv_hidden).view(batch_size, end, -1, self.head_dim)
+            value_states = self.v_proj(kv_hidden).view(batch_size, end, -1, self.head_dim) if self.v_proj is not None else key_states
+            key_states = self.k_norm(key_states)
+            key_states = _apply_rotary_pos_emb(
+                key_states,
+                cos[:, :end, :],
+                sin[:, :end, :],
+                unsqueeze_dim=2,
+            ).transpose(1, 2)
+            value_states = self.v_norm(value_states).transpose(1, 2)
+
+        if self.store_full_length_kv and not self.is_kv_shared_layer and end == seq_len:
+            shared_kv_states[self.layer_idx] = (key_states, value_states)
+
+        chunk_mask = None
+        if attention_mask is not None:
+            chunk_mask = attention_mask[:, :, start:end, :end]
+
+        attn_output, attn_weights = _stream_attention_forward(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            chunk_mask,
+        )
+        attn_output = attn_output.reshape(batch_size, chunk_len, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+
+class _StreamGemmaDecoderLayer(nn.Module):
+    def __init__(self, base_layer: nn.Module):
+        super().__init__()
+        self.base_layer = base_layer
+        if not isinstance(self.base_layer.self_attn, _StreamGemmaAttention):
+            self.base_layer.self_attn = _StreamGemmaAttention(self.base_layer.self_attn)
+
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.base_layer, name)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        per_layer_input: torch.Tensor = None,
+        shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
+        position_embeddings: torch.Tensor = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values=None,
+        chunk_range: tuple[int, int] | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if chunk_range is None:
+            return self.base_layer(
+                hidden_states=hidden_states,
+                per_layer_input=per_layer_input,
+                shared_kv_states=shared_kv_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                **kwargs,
+            )
+
+        start, end = chunk_range
+        residual = hidden_states[:, start:end, :]
+
+        hidden_states_norm = self.base_layer.input_layernorm(hidden_states)
+        attn_out, _ = self.base_layer.self_attn(
+            hidden_states=hidden_states_norm,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            shared_kv_states=shared_kv_states,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            chunk_range=chunk_range,
+            **kwargs,
+        )
+        hidden_states_chunk = self.base_layer.post_attention_layernorm(attn_out)
+        hidden_states_chunk = residual + hidden_states_chunk
+
+        residual = hidden_states_chunk
+        hidden_states_chunk = self.base_layer.pre_feedforward_layernorm(hidden_states_chunk)
+        hidden_states_chunk = self.base_layer.mlp(hidden_states_chunk)
+
+        if getattr(self.base_layer, "enable_moe_block", False):
+            hidden_states_1 = self.base_layer.post_feedforward_layernorm_1(hidden_states_chunk)
+            hidden_states_flat = residual.reshape(-1, residual.shape[-1])
+            _, top_k_weights, top_k_index = self.base_layer.router(hidden_states_flat)
+            hidden_states_2 = self.base_layer.pre_feedforward_layernorm_2(hidden_states_flat)
+            hidden_states_2 = self.base_layer.experts(hidden_states_2, top_k_index, top_k_weights)
+            hidden_states_2 = hidden_states_2.reshape(residual.shape)
+            hidden_states_2 = self.base_layer.post_feedforward_layernorm_2(hidden_states_2)
+            hidden_states_chunk = hidden_states_1 + hidden_states_2
+
+        hidden_states_chunk = self.base_layer.post_feedforward_layernorm(hidden_states_chunk)
+        hidden_states_chunk = residual + hidden_states_chunk
+
+        if getattr(self.base_layer, "hidden_size_per_layer_input", 0):
+            residual = hidden_states_chunk
+            if per_layer_input is None:
+                raise RuntimeError("per_layer_input is required for chunked Gemma4 replay")
+            per_layer_input = per_layer_input[:, start:end, :]
+            hidden_states_chunk = self.base_layer.per_layer_input_gate(hidden_states_chunk)
+            hidden_states_chunk = self.base_layer.act_fn(hidden_states_chunk)
+            hidden_states_chunk = hidden_states_chunk * per_layer_input
+            hidden_states_chunk = self.base_layer.per_layer_projection(hidden_states_chunk)
+            hidden_states_chunk = self.base_layer.post_per_layer_input_norm(hidden_states_chunk)
+            hidden_states_chunk = residual + hidden_states_chunk
+
+        return hidden_states_chunk * self.base_layer.layer_scalar
 
 
 def _get_layer_types(inner_model) -> list[str]:
@@ -70,6 +338,7 @@ def _run_layer(
     shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]],
     layer_type: str,
     per_layer_input: torch.Tensor | None = None,
+    chunk_range: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     output = layer(
         hidden_states=hidden_states,
@@ -79,6 +348,7 @@ def _run_layer(
         attention_mask=mask_mapping.get(layer_type, mask_mapping["full_attention"]),
         position_ids=position_ids,
         past_key_values=None,
+        chunk_range=chunk_range,
     )
     return output if not isinstance(output, tuple) else output[0]
 
@@ -105,6 +375,8 @@ class Gemma4Model(BaseModel):
         self.lora_fraction = float(getattr(self.config, "lora_fraction", 0.5))
         self._use_grad_checkpoint = bool(getattr(self.config, "use_grad_checkpoint", False))
         self._offload_prefix_to_cpu = bool(getattr(self.config, "offload_prefix_to_cpu", False))
+        token_chunk_size = int(getattr(self.config, "token_chunk_size", 0) or 0)
+        self._token_chunk_size = token_chunk_size if token_chunk_size > 0 else 0
 
         self._inner_model, self._lm_head = self._resolve_text_stack(self.model)
         self._layers = self._inner_model.layers
@@ -133,12 +405,21 @@ class Gemma4Model(BaseModel):
         self._inner_model, self._lm_head = self._resolve_text_stack(self.model)
         self._layers = self._inner_model.layers
         self._layer_types = _get_layer_types(self._inner_model)
+        self._wrap_suffix_layers_for_streaming()
 
         for param in self.model.parameters():
             param.requires_grad_(False)
         for name, param in self.model.named_parameters():
             if "lora_" in name:
                 param.requires_grad_(True)
+
+    def _wrap_suffix_layers_for_streaming(self) -> None:
+        for idx in range(self._prefix_split_layer, len(self._layers)):
+            layer = self._layers[idx]
+            if isinstance(layer, _StreamGemmaDecoderLayer):
+                continue
+            self._inner_model.layers[idx] = _StreamGemmaDecoderLayer(layer)
+        self._layers = self._inner_model.layers
 
     def _resolve_text_stack(self, model):
         seen = set()
@@ -258,6 +539,35 @@ class Gemma4Model(BaseModel):
         if tensor.device == device:
             return tensor
         return tensor.to(device=device, non_blocking=True)
+
+    def _move_tensor_slice(
+        self,
+        tensor: torch.Tensor | None,
+        device: torch.device,
+        seq_end: int | None = None,
+    ) -> torch.Tensor | None:
+        if tensor is None:
+            return None
+        if seq_end is not None:
+            tensor = tensor[:, :seq_end, ...]
+        return self._move_tensor(tensor, device)
+
+    def _materialize_shared_kv_states(
+        self,
+        shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]],
+        device: torch.device,
+        seq_end: int | None = None,
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+        materialized = {}
+        for key, (key_states, value_states) in shared_kv_states.items():
+            if seq_end is not None:
+                key_states = key_states[:, :, :seq_end, :]
+                value_states = value_states[:, :, :seq_end, :]
+            materialized[key] = (
+                self._move_tensor(key_states, device),
+                self._move_tensor(value_states, device),
+            )
+        return materialized
 
     def _offload_prefix_bundle_to_cpu(self, bundle: _PrefixBundle) -> _PrefixBundle:
         return _PrefixBundle(
@@ -393,18 +703,23 @@ class Gemma4Model(BaseModel):
             if per_layer_inputs is not None:
                 current_per_layer_input_source = per_layer_inputs[:, :, abs_idx, :]
 
-            def _layer_forward(h: torch.Tensor, _layer=layer, _abs_idx=abs_idx) -> torch.Tensor:
+            def _layer_forward(
+                h: torch.Tensor,
+                chunk_range: tuple[int, int] | None = None,
+                _layer=layer,
+                _abs_idx=abs_idx,
+            ) -> torch.Tensor:
                 per_layer_input_local = None
+                seq_end = None if chunk_range is None else chunk_range[1]
                 if current_per_layer_input_source is not None:
-                    per_layer_input_local = self._move_tensor(current_per_layer_input_source, h.device)
-                shared_kv_local = {
-                    key: (
-                        self._move_tensor(key_states, h.device),
-                        self._move_tensor(value_states, h.device),
-                    )
-                    for key, (key_states, value_states) in shared_kv_states.items()
-                }
-                return _run_layer(
+                    per_layer_input_local = self._move_tensor_slice(current_per_layer_input_source, h.device, seq_end)
+                if chunk_range is None:
+                    shared_kv_local = self._materialize_shared_kv_states(shared_kv_states, h.device, None)
+                    shared_kv_states.clear()
+                    shared_kv_states.update(shared_kv_local)
+                else:
+                    shared_kv_local = self._materialize_shared_kv_states(shared_kv_states, h.device, seq_end)
+                output = _run_layer(
                     _layer,
                     h,
                     mask_mapping,
@@ -413,14 +728,22 @@ class Gemma4Model(BaseModel):
                     shared_kv_local,
                     self._layer_types[_abs_idx],
                     per_layer_input=per_layer_input_local,
+                    chunk_range=chunk_range,
                 )
+                if seq_end is None or seq_end == h.shape[1]:
+                    for key, value in shared_kv_local.items():
+                        shared_kv_states[key] = value
+                return output
 
-            if self._use_grad_checkpoint and torch.is_grad_enabled():
-                hidden_states = torch.utils.checkpoint.checkpoint(
+            if self._use_grad_checkpoint and torch.is_grad_enabled() and self._token_chunk_size > 0:
+                hidden_states = _StreamCheckpointFunction.apply(
                     _layer_forward,
+                    self._token_chunk_size,
+                    self._offload_prefix_to_cpu,
                     hidden_states,
-                    use_reentrant=False,
                 )
+            elif self._use_grad_checkpoint and torch.is_grad_enabled():
+                hidden_states = torch.utils.checkpoint.checkpoint(_layer_forward, hidden_states, use_reentrant=False)
             else:
                 hidden_states = _layer_forward(hidden_states)
 
