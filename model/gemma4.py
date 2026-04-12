@@ -62,10 +62,14 @@ class _StreamCheckpointFunction(torch.autograd.Function):
 
         seq_len = hidden_states.shape[1]
         with torch.no_grad():
+            if hasattr(ctx.run_function, "prepare_for_replay"):
+                ctx.run_function.prepare_for_replay(hidden_states, requires_grad=False)
             outputs = []
             for start in range(0, seq_len, ctx.chunk_size):
                 end = min(start + ctx.chunk_size, seq_len)
                 outputs.append(run_function(hidden_states, chunk_range=(start, end)))
+            if hasattr(ctx.run_function, "clear_replay_cache"):
+                ctx.run_function.clear_replay_cache()
         return torch.cat(outputs, dim=1)
 
     @staticmethod
@@ -76,19 +80,28 @@ class _StreamCheckpointFunction(torch.autograd.Function):
             non_blocking=True,
         ).detach().requires_grad_(True)
         seq_len = grad_output.shape[1]
-
-        for start in range(0, seq_len, ctx.chunk_size):
-            end = min(start + ctx.chunk_size, seq_len)
+        shared_graph = False
+        if hasattr(ctx.run_function, "prepare_for_replay"):
             with torch.enable_grad():
-                output_chunk = ctx.run_function(
-                    hidden_states_detached,
-                    chunk_range=(start, end),
-                )
-                torch.autograd.backward(
-                    output_chunk,
-                    grad_tensors=grad_output[:, start:end, :].detach(),
-                    retain_graph=False,
-                )
+                ctx.run_function.prepare_for_replay(hidden_states_detached, requires_grad=True)
+            shared_graph = True
+
+        try:
+            for start in range(0, seq_len, ctx.chunk_size):
+                end = min(start + ctx.chunk_size, seq_len)
+                with torch.enable_grad():
+                    output_chunk = ctx.run_function(
+                        hidden_states_detached,
+                        chunk_range=(start, end),
+                    )
+                    torch.autograd.backward(
+                        output_chunk,
+                        grad_tensors=grad_output[:, start:end, :].detach(),
+                        retain_graph=shared_graph and end < seq_len,
+                    )
+        finally:
+            if hasattr(ctx.run_function, "clear_replay_cache"):
+                ctx.run_function.clear_replay_cache()
 
         return None, None, None, hidden_states_detached.grad
 
@@ -122,6 +135,8 @@ class _StreamGemmaAttention(nn.Module):
     def __init__(self, base_attn: nn.Module):
         super().__init__()
         self.base_attn = base_attn
+        self._replay_key_states: torch.Tensor | None = None
+        self._replay_value_states: torch.Tensor | None = None
 
     def __getattr__(self, name: str):
         try:
@@ -152,10 +167,9 @@ class _StreamGemmaAttention(nn.Module):
         batch_size, seq_len = hidden_states.shape[:2]
         start, end = chunk_range
         chunk_len = end - start
-        hidden_shape = (batch_size, -1, self.head_dim)
         cos, sin = position_embeddings
 
-        query_states = self.q_proj(hidden_states[:, start:end, :]).view(batch_size, chunk_len, -1, self.head_dim)
+        query_states = self.q_proj(hidden_states).view(batch_size, chunk_len, -1, self.head_dim)
         query_states = self.q_norm(query_states)
         query_states = _apply_rotary_pos_emb(
             query_states,
@@ -164,11 +178,15 @@ class _StreamGemmaAttention(nn.Module):
             unsqueeze_dim=2,
         ).transpose(1, 2)
 
-        if self.is_kv_shared_layer:
+        if self._replay_key_states is not None and self._replay_value_states is not None:
+            key_states = self._replay_key_states[:, :, :end, :]
+            value_states = self._replay_value_states[:, :, :end, :]
+        elif self.is_kv_shared_layer:
             key_states, value_states = shared_kv_states[self.kv_shared_layer_index]
             key_states = key_states.to(query_states.device, non_blocking=True)[:, :, :end, :]
             value_states = value_states.to(query_states.device, non_blocking=True)[:, :, :end, :]
         else:
+            hidden_shape = (batch_size, -1, self.head_dim)
             kv_hidden = hidden_states[:, :end, :]
             key_states = self.k_proj(kv_hidden).view(batch_size, end, -1, self.head_dim)
             value_states = self.v_proj(kv_hidden).view(batch_size, end, -1, self.head_dim) if self.v_proj is not None else key_states
@@ -199,6 +217,34 @@ class _StreamGemmaAttention(nn.Module):
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
+    def prepare_replay_kv(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: torch.Tensor,
+        shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]],
+    ) -> None:
+        cos, sin = position_embeddings
+        if self.is_kv_shared_layer:
+            key_states, value_states = shared_kv_states[self.kv_shared_layer_index]
+            self._replay_key_states = key_states
+            self._replay_value_states = value_states
+            return
+
+        batch_size, seq_len = hidden_states.shape[:2]
+        key_states = self.k_proj(hidden_states).view(batch_size, seq_len, -1, self.head_dim)
+        value_states = self.v_proj(hidden_states).view(batch_size, seq_len, -1, self.head_dim) if self.v_proj is not None else key_states
+        key_states = self.k_norm(key_states)
+        key_states = _apply_rotary_pos_emb(key_states, cos, sin, unsqueeze_dim=2).transpose(1, 2)
+        value_states = self.v_norm(value_states).transpose(1, 2)
+        self._replay_key_states = key_states
+        self._replay_value_states = value_states
+        if self.store_full_length_kv:
+            shared_kv_states[self.layer_idx] = (key_states, value_states)
+
+    def clear_replay_cache(self) -> None:
+        self._replay_key_states = None
+        self._replay_value_states = None
+
 
 class _StreamGemmaDecoderLayer(nn.Module):
     def __init__(self, base_layer: nn.Module):
@@ -206,6 +252,7 @@ class _StreamGemmaDecoderLayer(nn.Module):
         self.base_layer = base_layer
         if not isinstance(self.base_layer.self_attn, _StreamGemmaAttention):
             self.base_layer.self_attn = _StreamGemmaAttention(self.base_layer.self_attn)
+        self._replay_shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
 
     def __getattr__(self, name: str):
         try:
@@ -238,14 +285,18 @@ class _StreamGemmaDecoderLayer(nn.Module):
             )
 
         start, end = chunk_range
+        chunk_len = end - start
         residual = hidden_states[:, start:end, :]
-
-        hidden_states_norm = self.base_layer.input_layernorm(hidden_states)
+        use_replay_cache = self._replay_shared_kv_states is not None
+        if use_replay_cache:
+            hidden_states_norm = self.base_layer.input_layernorm(hidden_states[:, start:end, :])
+        else:
+            hidden_states_norm = self.base_layer.input_layernorm(hidden_states)
         attn_out, _ = self.base_layer.self_attn(
             hidden_states=hidden_states_norm,
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
-            shared_kv_states=shared_kv_states,
+            shared_kv_states=self._replay_shared_kv_states or shared_kv_states,
             position_ids=position_ids,
             past_key_values=past_key_values,
             chunk_range=chunk_range,
@@ -275,7 +326,8 @@ class _StreamGemmaDecoderLayer(nn.Module):
             residual = hidden_states_chunk
             if per_layer_input is None:
                 raise RuntimeError("per_layer_input is required for chunked Gemma4 replay")
-            per_layer_input = per_layer_input[:, start:end, :]
+            if per_layer_input.shape[1] != chunk_len:
+                per_layer_input = per_layer_input[:, start:end, :]
             hidden_states_chunk = self.base_layer.per_layer_input_gate(hidden_states_chunk)
             hidden_states_chunk = self.base_layer.act_fn(hidden_states_chunk)
             hidden_states_chunk = hidden_states_chunk * per_layer_input
@@ -284,6 +336,20 @@ class _StreamGemmaDecoderLayer(nn.Module):
             hidden_states_chunk = residual + hidden_states_chunk
 
         return hidden_states_chunk * self.base_layer.layer_scalar
+
+    def prepare_for_replay(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: torch.Tensor,
+        shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]],
+    ) -> None:
+        self._replay_shared_kv_states = shared_kv_states
+        hidden_states_norm = self.base_layer.input_layernorm(hidden_states)
+        self.base_layer.self_attn.prepare_replay_kv(hidden_states_norm, position_embeddings, shared_kv_states)
+
+    def clear_replay_cache(self) -> None:
+        self._replay_shared_kv_states = None
+        self.base_layer.self_attn.clear_replay_cache()
 
 
 def _get_layer_types(inner_model) -> list[str]:
@@ -703,49 +769,74 @@ class Gemma4Model(BaseModel):
             if per_layer_inputs is not None:
                 current_per_layer_input_source = per_layer_inputs[:, :, abs_idx, :]
 
-            def _layer_forward(
-                h: torch.Tensor,
-                chunk_range: tuple[int, int] | None = None,
-                _layer=layer,
-                _abs_idx=abs_idx,
-            ) -> torch.Tensor:
-                per_layer_input_local = None
-                seq_end = None if chunk_range is None else chunk_range[1]
-                if current_per_layer_input_source is not None:
-                    per_layer_input_local = self._move_tensor_slice(current_per_layer_input_source, h.device, seq_end)
-                if chunk_range is None:
-                    shared_kv_local = self._materialize_shared_kv_states(shared_kv_states, h.device, None)
-                    shared_kv_states.clear()
-                    shared_kv_states.update(shared_kv_local)
-                else:
-                    shared_kv_local = self._materialize_shared_kv_states(shared_kv_states, h.device, seq_end)
-                output = _run_layer(
-                    _layer,
-                    h,
-                    mask_mapping,
-                    position_embeddings,
-                    position_ids,
-                    shared_kv_local,
-                    self._layer_types[_abs_idx],
-                    per_layer_input=per_layer_input_local,
-                    chunk_range=chunk_range,
-                )
-                if seq_end is None or seq_end == h.shape[1]:
-                    for key, value in shared_kv_local.items():
-                        shared_kv_states[key] = value
-                return output
+            class _LayerReplay:
+                def __init__(self):
+                    self.shared_kv_local: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
+
+                def prepare_for_replay(self, h: torch.Tensor, requires_grad: bool) -> None:
+                    self.shared_kv_local = self_outer._materialize_shared_kv_states(shared_kv_states, h.device, None)
+                    if isinstance(layer, _StreamGemmaDecoderLayer):
+                        layer.prepare_for_replay(
+                            h,
+                            position_embeddings[self_outer._layer_types[abs_idx]],
+                            self.shared_kv_local,
+                        )
+
+                def clear_replay_cache(self) -> None:
+                    if isinstance(layer, _StreamGemmaDecoderLayer):
+                        layer.clear_replay_cache()
+                    self.shared_kv_local = None
+
+                def __call__(
+                    self,
+                    h: torch.Tensor,
+                    chunk_range: tuple[int, int] | None = None,
+                ) -> torch.Tensor:
+                    seq_end = None if chunk_range is None else chunk_range[1]
+                    per_layer_input_local = None
+                    if current_per_layer_input_source is not None:
+                        if chunk_range is None:
+                            per_layer_input_local = self_outer._move_tensor(current_per_layer_input_source, h.device)
+                        else:
+                            per_layer_input_local = self_outer._move_tensor(
+                                current_per_layer_input_source[:, chunk_range[0]:chunk_range[1], :],
+                                h.device,
+                            )
+
+                    shared_kv_local = self.shared_kv_local
+                    if shared_kv_local is None:
+                        shared_kv_local = self_outer._materialize_shared_kv_states(shared_kv_states, h.device, seq_end)
+
+                    output = _run_layer(
+                        layer,
+                        h,
+                        mask_mapping,
+                        position_embeddings,
+                        position_ids,
+                        shared_kv_local,
+                        self_outer._layer_types[abs_idx],
+                        per_layer_input=per_layer_input_local,
+                        chunk_range=chunk_range,
+                    )
+                    if seq_end is None or seq_end == h.shape[1]:
+                        for key, value in shared_kv_local.items():
+                            shared_kv_states[key] = value
+                    return output
+
+            self_outer = self
+            layer_replay = _LayerReplay()
 
             if self._use_grad_checkpoint and torch.is_grad_enabled() and self._token_chunk_size > 0:
                 hidden_states = _StreamCheckpointFunction.apply(
-                    _layer_forward,
+                    layer_replay,
                     self._token_chunk_size,
                     self._offload_prefix_to_cpu,
                     hidden_states,
                 )
             elif self._use_grad_checkpoint and torch.is_grad_enabled():
-                hidden_states = torch.utils.checkpoint.checkpoint(_layer_forward, hidden_states, use_reentrant=False)
+                hidden_states = torch.utils.checkpoint.checkpoint(layer_replay, hidden_states, use_reentrant=False)
             else:
-                hidden_states = _layer_forward(hidden_states)
+                hidden_states = layer_replay(hidden_states)
 
         return self._inner_model.norm(hidden_states)
 
