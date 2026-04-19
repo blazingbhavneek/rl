@@ -68,6 +68,22 @@ def _slice_shared_kv_states(
     }
 
 
+def _normalize_chunk_size(chunk_size: int | None) -> int:
+    chunk = int(chunk_size or 0)
+    return chunk if chunk > 0 else 0
+
+
+def _get_chunk_kv_range(
+    *,
+    start: int,
+    end: int,
+    sliding_window: int | None,
+) -> tuple[int, int]:
+    if sliding_window is None:
+        return 0, end
+    return max(0, start - sliding_window + 1), end
+
+
 class _StreamCheckpointFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -285,6 +301,15 @@ class _StreamGemmaAttention(nn.Module):
         start, end = chunk_range
         chunk_len = end - start
         cos, sin = position_embeddings
+        sliding_window = None
+        if getattr(self, "layer_type", None) == "sliding_attention":
+            sliding_window = getattr(self.config, "sliding_window", None)
+        kv_start, kv_end = _get_chunk_kv_range(
+            start=start,
+            end=end,
+            sliding_window=sliding_window,
+        )
+        need_full_store = self.store_full_length_kv and not self.is_kv_shared_layer and end == full_hidden_seq_len
 
         query_input = hidden_states if hidden_states.shape[1] == chunk_len else hidden_states[:, start:end, :]
         query_states = self.q_proj(query_input).view(batch_size, chunk_len, -1, self.head_dim)
@@ -296,47 +321,78 @@ class _StreamGemmaAttention(nn.Module):
             unsqueeze_dim=2,
         ).transpose(1, 2)
 
+        full_key_states = None
+        full_value_states = None
         if self._replay_key_states is not None and self._replay_value_states is not None:
-            key_states = self._replay_key_states[:, :, :end, :]
-            value_states = self._replay_value_states[:, :, :end, :]
+            key_states = self._replay_key_states[:, :, kv_start:kv_end, :]
+            value_states = self._replay_value_states[:, :, kv_start:kv_end, :]
+            if need_full_store:
+                full_key_states = self._replay_key_states[:, :, :end, :]
+                full_value_states = self._replay_value_states[:, :, :end, :]
         elif self.is_kv_shared_layer:
             key_states, value_states = shared_kv_states[self.kv_shared_layer_index]
-            key_states = key_states.to(query_states.device, non_blocking=True)[:, :, :end, :]
-            value_states = value_states.to(query_states.device, non_blocking=True)[:, :, :end, :]
+            key_states = key_states[:, :, kv_start:kv_end, :]
+            value_states = value_states[:, :, kv_start:kv_end, :]
+            key_states = key_states.to(query_states.device, non_blocking=True)
+            value_states = value_states.to(query_states.device, non_blocking=True)
         else:
-            kv_hidden = hidden_states[:, :end, :]
-            key_states = self.k_proj(kv_hidden).view(batch_size, end, -1, self.head_dim)
-            value_states = self.v_proj(kv_hidden).view(batch_size, end, -1, self.head_dim) if self.v_proj is not None else key_states
+            kv_hidden = hidden_states[:, kv_start:kv_end, :]
+            kv_len = kv_end - kv_start
+            key_states = self.k_proj(kv_hidden).view(batch_size, kv_len, -1, self.head_dim)
+            value_states = (
+                self.v_proj(kv_hidden).view(batch_size, kv_len, -1, self.head_dim)
+                if self.v_proj is not None
+                else key_states
+            )
             key_states = self.k_norm(key_states)
             key_states = _apply_rotary_pos_emb(
                 key_states,
-                cos[:, :end, :],
-                sin[:, :end, :],
+                cos[:, kv_start:kv_end, :],
+                sin[:, kv_start:kv_end, :],
                 unsqueeze_dim=2,
             ).transpose(1, 2)
             value_states = self.v_norm(value_states).transpose(1, 2)
+            if need_full_store:
+                if kv_start == 0:
+                    full_key_states = key_states
+                    full_value_states = value_states
+                else:
+                    full_kv_hidden = hidden_states[:, :end, :]
+                    full_key_states = self.k_proj(full_kv_hidden).view(batch_size, end, -1, self.head_dim)
+                    full_value_states = (
+                        self.v_proj(full_kv_hidden).view(batch_size, end, -1, self.head_dim)
+                        if self.v_proj is not None
+                        else full_key_states
+                    )
+                    full_key_states = self.k_norm(full_key_states)
+                    full_key_states = _apply_rotary_pos_emb(
+                        full_key_states,
+                        cos[:, :end, :],
+                        sin[:, :end, :],
+                        unsqueeze_dim=2,
+                    ).transpose(1, 2)
+                    full_value_states = self.v_norm(full_value_states).transpose(1, 2)
 
-        if self.store_full_length_kv and not self.is_kv_shared_layer and end == full_hidden_seq_len:
-            shared_kv_states[self.layer_idx] = (key_states, value_states)
+        if need_full_store:
+            if full_key_states is None or full_value_states is None:
+                raise RuntimeError("full shared kv store requested but full kv states were not prepared")
+            shared_kv_states[self.layer_idx] = (full_key_states, full_value_states)
 
-        kv_len = key_states.shape[-2]
         chunk_mask = None
         if attention_mask is not None:
             if attention_mask.dim() == 2:
-                sliding_window = None
-                if getattr(self, "layer_type", None) == "sliding_attention":
-                    sliding_window = getattr(self.config, "sliding_window", None)
                 chunk_mask = _make_chunk_attention_mask(
                     attention_mask,
                     start=start,
                     end=end,
-                    kv_end=kv_len,
+                    kv_start=kv_start,
+                    kv_end=kv_end,
                     dtype=query_states.dtype,
                     device=query_states.device,
                     sliding_window=sliding_window,
                 )
             else:
-                chunk_mask = attention_mask[:, :, start:end, :kv_len]
+                chunk_mask = attention_mask[:, :, start:end, kv_start:kv_end]
 
         attn_output, attn_weights = _stream_attention_forward(
             self,
@@ -499,23 +555,24 @@ def _make_chunk_attention_mask(
     *,
     start: int,
     end: int,
+    kv_start: int,
     kv_end: int,
     dtype: torch.dtype,
     device: torch.device,
     sliding_window: int | None = None,
 ) -> torch.Tensor | None:
     q_pos = torch.arange(start, end, device=device).unsqueeze(1)
-    k_pos = torch.arange(0, kv_end, device=device).unsqueeze(0)
+    k_pos = torch.arange(kv_start, kv_end, device=device).unsqueeze(0)
     causal = k_pos <= q_pos
     if sliding_window is not None:
         causal = causal & ((q_pos - k_pos) < sliding_window)
 
-    mask = torch.zeros((end - start, kv_end), device=device, dtype=dtype)
+    mask = torch.zeros((end - start, kv_end - kv_start), device=device, dtype=dtype)
     mask = mask.masked_fill(~causal, torch.finfo(dtype).min)
     mask = mask.unsqueeze(0).unsqueeze(0)
 
     if raw_attention_mask is not None:
-        pad = raw_attention_mask[:, :kv_end].to(device=device, non_blocking=True)
+        pad = raw_attention_mask[:, kv_start:kv_end].to(device=device, non_blocking=True)
         pad_mask = (pad == 0).unsqueeze(1).unsqueeze(2)
         mask = mask.masked_fill(pad_mask, torch.finfo(dtype).min)
     return mask
@@ -628,8 +685,17 @@ class Gemma4Model(BaseModel):
         self._use_grad_checkpoint = bool(getattr(self.config, "use_grad_checkpoint", False))
         self._use_compile = bool(getattr(self.config, "use_compile", False))
         self._offload_prefix_to_cpu = bool(getattr(self.config, "offload_prefix_to_cpu", False))
-        token_chunk_size = int(getattr(self.config, "token_chunk_size", 0) or 0)
-        self._token_chunk_size = token_chunk_size if token_chunk_size > 0 else 0
+        self._token_chunk_size = _normalize_chunk_size(getattr(self.config, "token_chunk_size", None))
+        self._prefix_token_chunk_size = _normalize_chunk_size(
+            getattr(self.config, "prefix_token_chunk_size", None)
+        )
+        if self._prefix_token_chunk_size == 0:
+            self._prefix_token_chunk_size = self._token_chunk_size
+        self._suffix_token_chunk_size = _normalize_chunk_size(
+            getattr(self.config, "suffix_token_chunk_size", None)
+        )
+        if self._suffix_token_chunk_size == 0:
+            self._suffix_token_chunk_size = self._token_chunk_size
 
         self._inner_model, self._lm_head = self._resolve_text_stack(self.model)
         self._layers = self._inner_model.layers
@@ -689,15 +755,11 @@ class Gemma4Model(BaseModel):
             new_layer = _StreamGemmaDecoderLayer(layer, use_compile=use_compile)
             if use_compile and idx >= self._prefix_split_layer:
                 base = new_layer.base_layer
-                # Compile MLP: gate→SiLU→*up→down; fullgraph=True since it's pure tensor ops
+                # Compile MLP only. The suffix path alternates between inference-mode
+                # prefix work and grad-enabled replay, and compiled RMSNorm modules
+                # hit Dynamo's recompile limit under that mixed-mode workload.
                 if hasattr(base, "mlp") and base.mlp is not None:
                     base.mlp = torch.compile(base.mlp, dynamic=True, fullgraph=True, mode=_COMPILE_MODE)
-                # Compile RMSNorm modules: each is square→mean→norm, fuses cleanly
-                for attr in self._SUFFIX_NORM_ATTRS:
-                    if hasattr(base, attr):
-                        setattr(base, attr, torch.compile(
-                            getattr(base, attr), dynamic=True, fullgraph=True, mode=_COMPILE_MODE,
-                        ))
             self._inner_model.layers[idx] = new_layer
         self._layers = self._inner_model.layers
 
@@ -782,6 +844,21 @@ class Gemma4Model(BaseModel):
         if per_layer_inputs is None:
             return None
         return self._inner_model.project_per_layer_inputs(hidden_states, per_layer_inputs)
+
+    def _mask_mapping_has_full_masks(self, mask_mapping: dict | None) -> bool:
+        if mask_mapping is None:
+            return True
+        saw_tensor = False
+        for mask in mask_mapping.values():
+            if mask is None:
+                continue
+            if torch.is_tensor(mask):
+                saw_tensor = True
+                if mask.dim() >= 4:
+                    return True
+                if mask.dim() == 2:
+                    return False
+        return not saw_tensor
 
     def _build_runtime(
         self,
@@ -947,12 +1024,13 @@ class Gemma4Model(BaseModel):
             .unsqueeze(0)
             .expand(batch_size, seq_len)
         )
+        use_chunked_prefix = self._prefix_token_chunk_size > 0
 
         mask_mapping, position_embeddings = self._build_runtime(
             hidden_states,
             attention_mask,
             position_ids,
-            build_full_masks=True,
+            build_full_masks=not use_chunked_prefix,
         )
 
         shared_kv_states = {}
@@ -961,15 +1039,15 @@ class Gemma4Model(BaseModel):
 
         for idx, layer in enumerate(self._layers[: self._prefix_split_layer]):
             per_layer_input = per_layer_inputs[:, :, idx, :] if per_layer_inputs is not None else None
-            if self._token_chunk_size > 0 and isinstance(layer, _StreamGemmaDecoderLayer):
+            if use_chunked_prefix and isinstance(layer, _StreamGemmaDecoderLayer):
                 layer.prepare_for_replay(
                     hidden_states,
                     position_embeddings[self._layer_types[idx]],
                     shared_kv_states,
                 )
                 output_chunks = torch.empty_like(hidden_states)
-                for start in range(0, seq_len, self._token_chunk_size):
-                    end = min(start + self._token_chunk_size, seq_len)
+                for start in range(0, seq_len, self._prefix_token_chunk_size):
+                    end = min(start + self._prefix_token_chunk_size, seq_len)
                     per_layer_chunk = None
                     if per_layer_input is not None:
                         per_layer_chunk = per_layer_input[:, start:end, :]
@@ -1011,8 +1089,16 @@ class Gemma4Model(BaseModel):
         prebuilt_mask_mapping: dict | None = None,
         prebuilt_position_embeddings: dict | None = None,
     ) -> torch.Tensor:
-        use_streaming_suffix = self._use_grad_checkpoint and torch.is_grad_enabled() and self._token_chunk_size > 0
-        if prebuilt_mask_mapping is not None and prebuilt_position_embeddings is not None:
+        use_streaming_suffix = (
+            self._use_grad_checkpoint and torch.is_grad_enabled() and self._suffix_token_chunk_size > 0
+        )
+        build_full_masks = not use_streaming_suffix
+        can_reuse_prebuilt = (
+            prebuilt_mask_mapping is not None
+            and prebuilt_position_embeddings is not None
+            and self._mask_mapping_has_full_masks(prebuilt_mask_mapping) == build_full_masks
+        )
+        if can_reuse_prebuilt:
             mask_mapping = prebuilt_mask_mapping
             position_embeddings = prebuilt_position_embeddings
         else:
@@ -1020,7 +1106,7 @@ class Gemma4Model(BaseModel):
                 hidden_states,
                 attention_mask,
                 position_ids,
-                build_full_masks=True,
+                build_full_masks=build_full_masks,
             )
 
         for offset, layer in enumerate(self._layers[self._prefix_split_layer :]):
@@ -1043,7 +1129,7 @@ class Gemma4Model(BaseModel):
             if use_streaming_suffix:
                 hidden_states = _StreamCheckpointFunction.apply(
                     layer_replay,
-                    self._token_chunk_size,
+                    self._suffix_token_chunk_size,
                     self._offload_prefix_to_cpu,
                     hidden_states,
                 )

@@ -12,6 +12,8 @@ class ModelConfig:
     chunk_size: int | None = None
     logprob_chunk_size: int | None = None
     token_chunk_size: int | None = None
+    prefix_token_chunk_size: int | None = None
+    suffix_token_chunk_size: int | None = None
     offload_prefix_to_cpu: bool = False
     
     attn_implementation: str = "eager"

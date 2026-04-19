@@ -5,8 +5,8 @@ Uses model.backward() — the actual training path — and searches for the
 largest sequence length that fits in GPU memory for the requested batch sizes.
 
 Compares two gradient-checkpointing strategies on the same model instance:
-  streaming  — _StreamCheckpointFunction (token_chunk_size > 0)
-  standard   — torch.utils.checkpoint.checkpoint (token_chunk_size = 0)
+  streaming  — _StreamCheckpointFunction on the suffix (suffix_token_chunk_size > 0)
+  standard   — torch.utils.checkpoint.checkpoint on the suffix (suffix_token_chunk_size = 0)
 """
 import csv
 import gc
@@ -32,17 +32,20 @@ DEFAULT_GEMMA4_LORA_TARGETS = [
     "gate_proj", "up_proj", "down_proj",
 ]
 
-DEFAULT_TOKEN_CHUNK_SIZE = 128
+DEFAULT_PREFIX_TOKEN_CHUNK_SIZE = 768
+DEFAULT_SUFFIX_TOKEN_CHUNK_SIZE = 128
 BENCH_BATCH_SIZES = [1, 4]
 CHECKPOINT_SEARCH_CONFIGS = [
-    ("streaming", DEFAULT_TOKEN_CHUNK_SIZE),
-    ("standard", 0),
+    ("streaming", DEFAULT_PREFIX_TOKEN_CHUNK_SIZE, DEFAULT_SUFFIX_TOKEN_CHUNK_SIZE),
+    ("standard", DEFAULT_PREFIX_TOKEN_CHUNK_SIZE, 0),
 ]
 DEFAULT_START_SEQ_LEN = 512
 DEFAULT_SEARCH_STEP   = 256
+DEFAULT_WARM_SEQ_LEN = 8192
 
 
 SEARCH_BATCH_SIZES = BENCH_BATCH_SIZES[:]
+WARM_TIMING_BATCH_SIZES = [1]
 
 
 USE_COMPILE = True  # set True to benchmark torch.compile (first step ~60s warmup, then faster)
@@ -56,7 +59,8 @@ def _build_config() -> ModelConfig:
         lora_alpha=256,
         chunk_size=256,
         logprob_chunk_size=128,
-        token_chunk_size=DEFAULT_TOKEN_CHUNK_SIZE,
+        prefix_token_chunk_size=DEFAULT_PREFIX_TOKEN_CHUNK_SIZE,
+        suffix_token_chunk_size=DEFAULT_SUFFIX_TOKEN_CHUNK_SIZE,
         use_grad_checkpoint=True,
         use_compile=USE_COMPILE,
         attn_implementation="sdpa",
@@ -140,6 +144,14 @@ class MaxFitResult(NamedTuple):
     batch_size: int
     max_seq_len: int
     max_batch_tokens: int
+    peak_cuda_mb: float
+    time_s: float
+
+
+class WarmTimingResult(NamedTuple):
+    label: str
+    batch_size: int
+    seq_len: int
     peak_cuda_mb: float
     time_s: float
 
@@ -264,6 +276,52 @@ def _find_max_seq(
     )
 
 
+def _measure_warmed_timing(
+    label: str,
+    model: Gemma4Model,
+    batch_size: int,
+    loss_fn,
+    *,
+    seq_len: int,
+) -> WarmTimingResult:
+    messages, completion_text = _make_sample(model.tokenizer, seq_len)
+    messages_batch = [messages] * batch_size
+    completion_texts = [completion_text] * batch_size
+
+    for _ in range(2):
+        _zero_all_grads(model.model)
+        model.backward(
+            messages=messages_batch,
+            completion_texts=completion_texts,
+            loss_fn=loss_fn,
+        )
+        _cleanup(model)
+
+    _zero_all_grads(model.model)
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    model.backward(
+        messages=messages_batch,
+        completion_texts=completion_texts,
+        loss_fn=loss_fn,
+    )
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elapsed = time.perf_counter() - t0
+    peak_mb = float(torch.cuda.max_memory_allocated() / 1024**2) if torch.cuda.is_available() else 0.0
+    print(f"[{label}] warm seq={seq_len} peak={peak_mb:.0f}MB time={elapsed:.2f}s")
+    _cleanup(model)
+    return WarmTimingResult(
+        label=label,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        peak_cuda_mb=peak_mb,
+        time_s=elapsed,
+    )
+
+
 def run_max_sequence_length_test(model_path: str) -> None:
     print("[bench] loading model")
     config = _build_config()
@@ -271,16 +329,19 @@ def run_max_sequence_length_test(model_path: str) -> None:
     model.model.eval()
     print(
         f"[bench] prefix_split={model._prefix_split_layer}/{len(model._layers)} layers "
-        f"chunk_size={config.chunk_size} token_chunk={config.token_chunk_size}"
+        f"chunk_size={config.chunk_size} "
+        f"prefix_chunk={config.prefix_token_chunk_size} "
+        f"suffix_chunk={config.suffix_token_chunk_size}"
     )
 
     max_supported = int(getattr(model._inner_model.config, "max_position_embeddings", 131072))
 
     print("\n[bench] === max sequence search by checkpoint algo ===")
     checkpoint_max_results: list[MaxFitResult] = []
-    for algo_label, token_chunk_size in CHECKPOINT_SEARCH_CONFIGS:
+    for algo_label, prefix_token_chunk_size, suffix_token_chunk_size in CHECKPOINT_SEARCH_CONFIGS:
         model._use_grad_checkpoint = True
-        model._token_chunk_size = token_chunk_size
+        model._prefix_token_chunk_size = prefix_token_chunk_size
+        model._suffix_token_chunk_size = suffix_token_chunk_size
         for batch_size in SEARCH_BATCH_SIZES:
             r = _find_max_seq(
                 f"{algo_label}-b{batch_size}",
@@ -299,13 +360,45 @@ def run_max_sequence_length_test(model_path: str) -> None:
             )
 
     print("\n[bench] === max sequence summary by checkpoint algo ===")
-    for algo_label, _ in CHECKPOINT_SEARCH_CONFIGS:
+    for algo_label, _, _ in CHECKPOINT_SEARCH_CONFIGS:
         algo_results = [r for r in checkpoint_max_results if r.label.startswith(f"{algo_label}-")]
         for r in sorted(algo_results, key=lambda item: item.batch_size):
             print(
                 f"  {algo_label:9s} batch={r.batch_size:2d} "
                 f"max_seq={r.max_seq_len:6d} max_batch_tokens={r.max_batch_tokens:7d} "
                 f"time={r.time_s:.2f}s"
+            )
+
+    print("\n[bench] === warmed steady-state timing ===")
+    warm_timing_results: list[WarmTimingResult] = []
+    for algo_label, prefix_token_chunk_size, suffix_token_chunk_size in CHECKPOINT_SEARCH_CONFIGS:
+        model._use_grad_checkpoint = True
+        model._prefix_token_chunk_size = prefix_token_chunk_size
+        model._suffix_token_chunk_size = suffix_token_chunk_size
+        for batch_size in WARM_TIMING_BATCH_SIZES:
+            max_result = next(
+                (
+                    result
+                    for result in checkpoint_max_results
+                    if result.label == f"{algo_label}-b{batch_size}"
+                ),
+                None,
+            )
+            if max_result is None or max_result.max_seq_len <= 0:
+                continue
+            seq_len = min(DEFAULT_WARM_SEQ_LEN, max_result.max_seq_len)
+            timing = _measure_warmed_timing(
+                f"{algo_label}-warm-b{batch_size}",
+                model,
+                batch_size,
+                _loss_fn_batch,
+                seq_len=seq_len,
+            )
+            warm_timing_results.append(timing)
+            print(
+                f"[warm]      {algo_label:9s} batch={batch_size:2d} "
+                f"seq={timing.seq_len:6d} peak={timing.peak_cuda_mb:.0f}MB "
+                f"time={timing.time_s:.2f}s"
             )
 
     csv_path = Path(__file__).with_name("test_max_sequence_length_max_seq.csv")
@@ -322,6 +415,20 @@ def run_max_sequence_length_test(model_path: str) -> None:
                 f"{r.time_s:.2f}",
             ])
     print(f"\n[bench] csv={csv_path}")
+
+    warm_csv_path = Path(__file__).with_name("test_max_sequence_length_warm_timing.csv")
+    with warm_csv_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["label", "batch_size", "seq_len", "peak_cuda_mb", "time_s"])
+        for r in warm_timing_results:
+            writer.writerow([
+                r.label,
+                r.batch_size,
+                r.seq_len,
+                f"{r.peak_cuda_mb:.1f}",
+                f"{r.time_s:.2f}",
+            ])
+    print(f"[bench] warm_csv={warm_csv_path}")
 
     del model
     gc.collect()
