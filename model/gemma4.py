@@ -1,9 +1,16 @@
+import inspect
 import math
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable
 
 import torch
 import torch.nn as nn
+import torch._functorch.config as _functorch_config
+
+# Donated buffers are incompatible with retain_graph=True used in
+# _StreamCheckpointFunction.backward. Disable globally before any compilation.
+_functorch_config.donated_buffer = False
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
@@ -17,6 +24,8 @@ class _PrefixBundle:
     position_ids: torch.Tensor
     shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]]
     per_layer_inputs: torch.Tensor | None
+    mask_mapping: dict | None = None
+    position_embeddings: dict | None = None
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -44,6 +53,21 @@ def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
+def _slice_shared_kv_states(
+    shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]],
+    seq_end: int | None,
+) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+    if seq_end is None:
+        return shared_kv_states
+    return {
+        key: (
+            key_states[:, :, :seq_end, :],
+            value_states[:, :, :seq_end, :],
+        )
+        for key, (key_states, value_states) in shared_kv_states.items()
+    }
+
+
 class _StreamCheckpointFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -57,20 +81,20 @@ class _StreamCheckpointFunction(torch.autograd.Function):
         ctx.chunk_size = max(1, int(chunk_size))
         saved_hidden = hidden_states.detach()
         if offload_to_cpu and saved_hidden.device.type != "cpu":
-            saved_hidden = saved_hidden.to("cpu")
+            saved_hidden = saved_hidden.to("cpu", non_blocking=True)
         ctx.save_for_backward(saved_hidden)
 
         seq_len = hidden_states.shape[1]
         with torch.no_grad():
             if hasattr(ctx.run_function, "prepare_for_replay"):
                 ctx.run_function.prepare_for_replay(hidden_states, requires_grad=False)
-            outputs = []
+            outputs = torch.empty_like(hidden_states)
             for start in range(0, seq_len, ctx.chunk_size):
                 end = min(start + ctx.chunk_size, seq_len)
-                outputs.append(run_function(hidden_states, chunk_range=(start, end)))
+                outputs[:, start:end, :] = run_function(hidden_states, chunk_range=(start, end))
             if hasattr(ctx.run_function, "clear_replay_cache"):
                 ctx.run_function.clear_replay_cache()
-        return torch.cat(outputs, dim=1)
+        return outputs
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
@@ -106,6 +130,9 @@ class _StreamCheckpointFunction(torch.autograd.Function):
         return None, None, None, hidden_states_detached.grad
 
 
+_COMPILE_MODE = "default"
+
+
 def _stream_attention_forward(
     module,
     query: torch.Tensor,
@@ -122,13 +149,102 @@ def _stream_attention_forward(
         attn_weights = torch.tanh(attn_weights / softcap) * softcap
     if attention_mask is not None:
         attn_weights = attn_weights + attention_mask
-
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
     if module.training and module.attention_dropout:
         attn_weights = nn.functional.dropout(attn_weights, p=module.attention_dropout, training=True)
     attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    return attn_output, attn_weights
+    return attn_output.transpose(1, 2), attn_weights
+
+
+class _LayerReplay:
+    def __init__(
+        self,
+        layer,
+        abs_idx: int,
+        current_per_layer_input_source: torch.Tensor | None,
+        self_outer,
+        mask_mapping: dict,
+        position_embeddings: dict,
+        position_ids: torch.Tensor,
+        shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]],
+    ):
+        self.layer = layer
+        self.abs_idx = abs_idx
+        self.current_per_layer_input_source = current_per_layer_input_source
+        self.self_outer = self_outer
+        self.mask_mapping = mask_mapping
+        self.position_embeddings = position_embeddings
+        self.position_ids = position_ids
+        self.shared_kv_states = shared_kv_states
+        self.shared_kv_local: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
+        self._materialized_shared_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
+
+    def _get_materialized_shared_kv(
+        self,
+        device: torch.device,
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+        if self._materialized_shared_kv is None:
+            self._materialized_shared_kv = self.self_outer._materialize_shared_kv_states(
+                self.shared_kv_states,
+                device,
+                None,
+            )
+        return self._materialized_shared_kv
+
+    def prepare_for_replay(self, h: torch.Tensor, requires_grad: bool) -> None:
+        self.shared_kv_local = self._get_materialized_shared_kv(h.device)
+        if isinstance(self.layer, _StreamGemmaDecoderLayer):
+            self.layer.prepare_for_replay(
+                h,
+                self.position_embeddings[self.self_outer._layer_types[self.abs_idx]],
+                self.shared_kv_local,
+            )
+
+    def clear_replay_cache(self) -> None:
+        if isinstance(self.layer, _StreamGemmaDecoderLayer):
+            self.layer.clear_replay_cache()
+        self.shared_kv_local = None
+        self._materialized_shared_kv = None
+
+    def __call__(
+        self,
+        h: torch.Tensor,
+        chunk_range: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        seq_end = None if chunk_range is None else chunk_range[1]
+        per_layer_input_local = None
+        if self.current_per_layer_input_source is not None:
+            if chunk_range is None:
+                per_layer_input_local = self.self_outer._move_tensor(self.current_per_layer_input_source, h.device)
+            else:
+                per_layer_input_local = self.self_outer._move_tensor(
+                    self.current_per_layer_input_source[:, chunk_range[0]:chunk_range[1], :],
+                    h.device,
+                )
+
+        full_shared_kv = self.shared_kv_local
+        if full_shared_kv is None:
+            full_shared_kv = self._get_materialized_shared_kv(h.device)
+        if seq_end is None or seq_end == h.shape[1]:
+            shared_kv_local = full_shared_kv
+        else:
+            shared_kv_local = _slice_shared_kv_states(full_shared_kv, seq_end)
+
+        output = _run_layer(
+            self.layer,
+            h,
+            self.mask_mapping,
+            self.position_embeddings,
+            self.position_ids,
+            shared_kv_local,
+            self.self_outer._layer_types[self.abs_idx],
+            per_layer_input=per_layer_input_local,
+            chunk_range=chunk_range,
+        )
+        if seq_end is None or seq_end == h.shape[1]:
+            for key, value in full_shared_kv.items():
+                self.shared_kv_states[key] = value
+        return output
 
 
 class _StreamGemmaAttention(nn.Module):
@@ -154,6 +270,7 @@ class _StreamGemmaAttention(nn.Module):
         chunk_range: tuple[int, int] | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        full_hidden_seq_len = kwargs.pop("full_hidden_seq_len", hidden_states.shape[1])
         if chunk_range is None:
             return self.base_attn(
                 hidden_states=hidden_states,
@@ -164,7 +281,7 @@ class _StreamGemmaAttention(nn.Module):
                 **kwargs,
             )
 
-        batch_size, seq_len = hidden_states.shape[:2]
+        batch_size = hidden_states.shape[0]
         start, end = chunk_range
         chunk_len = end - start
         cos, sin = position_embeddings
@@ -187,7 +304,6 @@ class _StreamGemmaAttention(nn.Module):
             key_states = key_states.to(query_states.device, non_blocking=True)[:, :, :end, :]
             value_states = value_states.to(query_states.device, non_blocking=True)[:, :, :end, :]
         else:
-            hidden_shape = (batch_size, -1, self.head_dim)
             kv_hidden = hidden_states[:, :end, :]
             key_states = self.k_proj(kv_hidden).view(batch_size, end, -1, self.head_dim)
             value_states = self.v_proj(kv_hidden).view(batch_size, end, -1, self.head_dim) if self.v_proj is not None else key_states
@@ -200,7 +316,7 @@ class _StreamGemmaAttention(nn.Module):
             ).transpose(1, 2)
             value_states = self.v_norm(value_states).transpose(1, 2)
 
-        if self.store_full_length_kv and not self.is_kv_shared_layer and end == seq_len:
+        if self.store_full_length_kv and not self.is_kv_shared_layer and end == full_hidden_seq_len:
             shared_kv_states[self.layer_idx] = (key_states, value_states)
 
         kv_len = key_states.shape[-2]
@@ -229,7 +345,7 @@ class _StreamGemmaAttention(nn.Module):
             value_states,
             chunk_mask,
         )
-        attn_output = attn_output.reshape(batch_size, chunk_len, -1).contiguous()
+        attn_output = attn_output.reshape(batch_size, chunk_len, -1)
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
@@ -263,9 +379,10 @@ class _StreamGemmaAttention(nn.Module):
 
 
 class _StreamGemmaDecoderLayer(nn.Module):
-    def __init__(self, base_layer: nn.Module):
+    def __init__(self, base_layer: nn.Module, use_compile: bool = False):
         super().__init__()
         self.base_layer = base_layer
+        self._use_compile = use_compile
         if not isinstance(self.base_layer.self_attn, _StreamGemmaAttention):
             self.base_layer.self_attn = _StreamGemmaAttention(self.base_layer.self_attn)
         self._replay_shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
@@ -303,11 +420,12 @@ class _StreamGemmaDecoderLayer(nn.Module):
         start, end = chunk_range
         chunk_len = end - start
         residual = hidden_states[:, start:end, :]
+        full_hidden_seq_len = hidden_states.shape[1]
         use_replay_cache = self._replay_shared_kv_states is not None
         if use_replay_cache:
             hidden_states_norm = self.base_layer.input_layernorm(hidden_states[:, start:end, :])
         else:
-            hidden_states_norm = self.base_layer.input_layernorm(hidden_states)
+            hidden_states_norm = self.base_layer.input_layernorm(hidden_states[:, :end, :])
         attn_out, _ = self.base_layer.self_attn(
             hidden_states=hidden_states_norm,
             position_embeddings=position_embeddings,
@@ -316,6 +434,7 @@ class _StreamGemmaDecoderLayer(nn.Module):
             position_ids=position_ids,
             past_key_values=past_key_values,
             chunk_range=chunk_range,
+            full_hidden_seq_len=full_hidden_seq_len,
             **kwargs,
         )
         hidden_states_chunk = self.base_layer.post_attention_layernorm(attn_out)
@@ -396,35 +515,25 @@ def _make_chunk_attention_mask(
     mask = mask.unsqueeze(0).unsqueeze(0)
 
     if raw_attention_mask is not None:
-        pad = raw_attention_mask[:, :kv_end].to(device=device)
+        pad = raw_attention_mask[:, :kv_end].to(device=device, non_blocking=True)
         pad_mask = (pad == 0).unsqueeze(1).unsqueeze(2)
         mask = mask.masked_fill(pad_mask, torch.finfo(dtype).min)
     return mask
 
 
-def _build_mask_mapping(inner_model, hidden_states, attention_mask, position_ids):
+def _build_mask_mapping(inner_model, hidden_states, attention_mask, position_ids, inputs_embeds_kwarg: str):
     cfg = inner_model.config
-    base_kwargs = {
+    mask_kwargs = {
         "config": cfg,
-        "inputs_embeds": hidden_states,
+        inputs_embeds_kwarg: hidden_states,
         "attention_mask": attention_mask,
-        "cache_position": None,
         "past_key_values": None,
         "position_ids": position_ids,
     }
-    try:
-        full_mask = create_causal_mask(**base_kwargs)
-        sliding_mask = create_sliding_window_causal_mask(**base_kwargs)
-    except TypeError:
-        legacy_kwargs = {
-            "config": cfg,
-            "input_embeds": hidden_states,
-            "attention_mask": attention_mask,
-            "past_key_values": None,
-            "position_ids": position_ids,
-        }
-        full_mask = create_causal_mask(**legacy_kwargs)
-        sliding_mask = create_sliding_window_causal_mask(**legacy_kwargs)
+    if inputs_embeds_kwarg == "inputs_embeds":
+        mask_kwargs["cache_position"] = None
+    full_mask = create_causal_mask(**mask_kwargs)
+    sliding_mask = create_sliding_window_causal_mask(**mask_kwargs)
     return {
         "full_attention": full_mask,
         "sliding_attention": sliding_mask,
@@ -446,6 +555,7 @@ def _build_runtime(
     position_ids: torch.Tensor,
     *,
     build_full_masks: bool,
+    causal_mask_inputs_embeds_kwarg: str,
 ) -> tuple[dict, dict]:
     if build_full_masks:
         mask_mapping = _build_mask_mapping(
@@ -453,6 +563,7 @@ def _build_runtime(
             hidden_states.detach(),
             attention_mask,
             position_ids,
+            causal_mask_inputs_embeds_kwarg,
         )
     else:
         mask_mapping = {
@@ -515,6 +626,7 @@ class Gemma4Model(BaseModel):
         self.lora = getattr(self.config, "lora")
         self.lora_fraction = float(getattr(self.config, "lora_fraction", 0.5))
         self._use_grad_checkpoint = bool(getattr(self.config, "use_grad_checkpoint", False))
+        self._use_compile = bool(getattr(self.config, "use_compile", False))
         self._offload_prefix_to_cpu = bool(getattr(self.config, "offload_prefix_to_cpu", False))
         token_chunk_size = int(getattr(self.config, "token_chunk_size", 0) or 0)
         self._token_chunk_size = token_chunk_size if token_chunk_size > 0 else 0
@@ -523,6 +635,11 @@ class Gemma4Model(BaseModel):
         self._layers = self._inner_model.layers
         self._layer_types = _get_layer_types(self._inner_model)
         self._prefix_split_layer = self._compute_prefix_end(len(self._layers), self.lora_fraction)
+        self._causal_mask_inputs_embeds_kwarg = (
+            "inputs_embeds"
+            if "inputs_embeds" in inspect.signature(create_causal_mask).parameters
+            else "input_embeds"
+        )
 
         lora_targets = (
             self.lora
@@ -547,6 +664,7 @@ class Gemma4Model(BaseModel):
         self._layers = self._inner_model.layers
         self._layer_types = _get_layer_types(self._inner_model)
         self._wrap_suffix_layers_for_streaming()
+        self._model_device = next(self.model.parameters()).device
 
         for param in self.model.parameters():
             param.requires_grad_(False)
@@ -554,21 +672,42 @@ class Gemma4Model(BaseModel):
             if "lora_" in name:
                 param.requires_grad_(True)
 
+    _SUFFIX_NORM_ATTRS = (
+        "input_layernorm",
+        "post_attention_layernorm",
+        "pre_feedforward_layernorm",
+        "post_feedforward_layernorm",
+    )
+
     def _wrap_suffix_layers_for_streaming(self) -> None:
+        use_compile = self._use_compile
         for idx in range(len(self._layers)):
             layer = self._layers[idx]
             if isinstance(layer, _StreamGemmaDecoderLayer):
+                layer._use_compile = use_compile
                 continue
-            self._inner_model.layers[idx] = _StreamGemmaDecoderLayer(layer)
+            new_layer = _StreamGemmaDecoderLayer(layer, use_compile=use_compile)
+            if use_compile and idx >= self._prefix_split_layer:
+                base = new_layer.base_layer
+                # Compile MLP: gate→SiLU→*up→down; fullgraph=True since it's pure tensor ops
+                if hasattr(base, "mlp") and base.mlp is not None:
+                    base.mlp = torch.compile(base.mlp, dynamic=True, fullgraph=True, mode=_COMPILE_MODE)
+                # Compile RMSNorm modules: each is square→mean→norm, fuses cleanly
+                for attr in self._SUFFIX_NORM_ATTRS:
+                    if hasattr(base, attr):
+                        setattr(base, attr, torch.compile(
+                            getattr(base, attr), dynamic=True, fullgraph=True, mode=_COMPILE_MODE,
+                        ))
+            self._inner_model.layers[idx] = new_layer
         self._layers = self._inner_model.layers
 
     def _resolve_text_stack(self, model):
         seen = set()
-        queue = [model]
+        queue = deque([model])
         ordered_candidates = []
 
         while queue:
-            candidate = queue.pop(0)
+            candidate = queue.popleft()
             if candidate is None or id(candidate) in seen:
                 continue
             seen.add(id(candidate))
@@ -659,6 +798,7 @@ class Gemma4Model(BaseModel):
             attention_mask,
             position_ids,
             build_full_masks=build_full_masks,
+            causal_mask_inputs_embeds_kwarg=self._causal_mask_inputs_embeds_kwarg,
         )
 
     def _detach_shared_kv_states(
@@ -708,13 +848,20 @@ class Gemma4Model(BaseModel):
 
     def _offload_prefix_bundle_to_cpu(self, bundle: _PrefixBundle) -> _PrefixBundle:
         return _PrefixBundle(
-            hidden_prefix=bundle.hidden_prefix.to("cpu"),
-            position_ids=bundle.position_ids.to("cpu"),
+            hidden_prefix=bundle.hidden_prefix.to("cpu", non_blocking=True),
+            position_ids=bundle.position_ids.to("cpu", non_blocking=True),
             shared_kv_states={
-                key: (key_states.to("cpu"), value_states.to("cpu"))
+                key: (
+                    key_states.to("cpu", non_blocking=True),
+                    value_states.to("cpu", non_blocking=True),
+                )
                 for key, (key_states, value_states) in bundle.shared_kv_states.items()
             },
-            per_layer_inputs=bundle.per_layer_inputs.to("cpu") if bundle.per_layer_inputs is not None else None,
+            per_layer_inputs=(
+                bundle.per_layer_inputs.to("cpu", non_blocking=True)
+                if bundle.per_layer_inputs is not None
+                else None
+            ),
         )
 
     def _build_prefix_bundle(
@@ -722,7 +869,7 @@ class Gemma4Model(BaseModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> _PrefixBundle:
-        hidden_prefix, position_ids, shared_kv_states, per_layer_inputs = self._forward_prefix(
+        hidden_prefix, position_ids, shared_kv_states, per_layer_inputs, mask_mapping, position_embeddings = self._forward_prefix(
             input_ids,
             attention_mask,
         )
@@ -731,6 +878,8 @@ class Gemma4Model(BaseModel):
             position_ids=_to_normal_tensor(position_ids),
             shared_kv_states=self._detach_shared_kv_states(shared_kv_states),
             per_layer_inputs=_to_normal_tensor(per_layer_inputs),
+            mask_mapping=mask_mapping,
+            position_embeddings=position_embeddings,
         )
         if self._offload_prefix_to_cpu:
             bundle = self._offload_prefix_bundle_to_cpu(bundle)
@@ -745,7 +894,7 @@ class Gemma4Model(BaseModel):
         dict[int, tuple[torch.Tensor, torch.Tensor]],
         torch.Tensor | None,
     ]:
-        model_device = next(self.model.parameters()).device
+        model_device = self._model_device
         hidden_prefix = self._move_tensor(bundle.hidden_prefix, model_device)
         if hidden_prefix is None:
             raise RuntimeError("prefix bundle did not contain hidden_prefix")
@@ -773,6 +922,8 @@ class Gemma4Model(BaseModel):
             attention_mask,
             shared_kv_states,
             per_layer_inputs,
+            prebuilt_mask_mapping=bundle.mask_mapping,
+            prebuilt_position_embeddings=bundle.position_embeddings,
         )
 
     def _forward_prefix(
@@ -784,6 +935,8 @@ class Gemma4Model(BaseModel):
         torch.Tensor,
         dict[int, tuple[torch.Tensor, torch.Tensor]],
         torch.Tensor | None,
+        dict,
+        dict,
     ]:
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
@@ -795,12 +948,11 @@ class Gemma4Model(BaseModel):
             .expand(batch_size, seq_len)
         )
 
-        use_chunked_prefix = self._token_chunk_size > 0
         mask_mapping, position_embeddings = self._build_runtime(
             hidden_states,
             attention_mask,
             position_ids,
-            build_full_masks=not use_chunked_prefix,
+            build_full_masks=True,
         )
 
         shared_kv_states = {}
@@ -809,33 +961,31 @@ class Gemma4Model(BaseModel):
 
         for idx, layer in enumerate(self._layers[: self._prefix_split_layer]):
             per_layer_input = per_layer_inputs[:, :, idx, :] if per_layer_inputs is not None else None
-            if use_chunked_prefix and isinstance(layer, _StreamGemmaDecoderLayer):
+            if self._token_chunk_size > 0 and isinstance(layer, _StreamGemmaDecoderLayer):
                 layer.prepare_for_replay(
                     hidden_states,
                     position_embeddings[self._layer_types[idx]],
                     shared_kv_states,
                 )
-                output_chunks = []
+                output_chunks = torch.empty_like(hidden_states)
                 for start in range(0, seq_len, self._token_chunk_size):
                     end = min(start + self._token_chunk_size, seq_len)
                     per_layer_chunk = None
                     if per_layer_input is not None:
                         per_layer_chunk = per_layer_input[:, start:end, :]
-                    output_chunks.append(
-                        _run_layer(
-                            layer,
-                            hidden_states,
-                            mask_mapping,
-                            position_embeddings,
-                            position_ids,
-                            shared_kv_states,
-                            self._layer_types[idx],
-                            per_layer_input=per_layer_chunk,
-                            chunk_range=(start, end),
-                        )
+                    output_chunks[:, start:end, :] = _run_layer(
+                        layer,
+                        hidden_states,
+                        mask_mapping,
+                        position_embeddings,
+                        position_ids,
+                        shared_kv_states,
+                        self._layer_types[idx],
+                        per_layer_input=per_layer_chunk,
+                        chunk_range=(start, end),
                     )
                 layer.clear_replay_cache()
-                hidden_states = torch.cat(output_chunks, dim=1)
+                hidden_states = output_chunks
             else:
                 hidden_states = _run_layer(
                     layer,
@@ -848,7 +998,7 @@ class Gemma4Model(BaseModel):
                     per_layer_input=per_layer_input,
                 )
 
-        return hidden_states, position_ids, shared_kv_states, per_layer_inputs
+        return hidden_states, position_ids, shared_kv_states, per_layer_inputs, mask_mapping, position_embeddings
 
     def _forward_suffix(
         self,
@@ -857,14 +1007,21 @@ class Gemma4Model(BaseModel):
         attention_mask: torch.Tensor,
         shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]],
         per_layer_inputs: torch.Tensor | None,
+        *,
+        prebuilt_mask_mapping: dict | None = None,
+        prebuilt_position_embeddings: dict | None = None,
     ) -> torch.Tensor:
         use_streaming_suffix = self._use_grad_checkpoint and torch.is_grad_enabled() and self._token_chunk_size > 0
-        mask_mapping, position_embeddings = self._build_runtime(
-            hidden_states,
-            attention_mask,
-            position_ids,
-            build_full_masks=not use_streaming_suffix,
-        )
+        if prebuilt_mask_mapping is not None and prebuilt_position_embeddings is not None:
+            mask_mapping = prebuilt_mask_mapping
+            position_embeddings = prebuilt_position_embeddings
+        else:
+            mask_mapping, position_embeddings = self._build_runtime(
+                hidden_states,
+                attention_mask,
+                position_ids,
+                build_full_masks=True,
+            )
 
         for offset, layer in enumerate(self._layers[self._prefix_split_layer :]):
             abs_idx = self._prefix_split_layer + offset
@@ -872,62 +1029,16 @@ class Gemma4Model(BaseModel):
             if per_layer_inputs is not None:
                 current_per_layer_input_source = per_layer_inputs[:, :, abs_idx, :]
 
-            class _LayerReplay:
-                def __init__(self):
-                    self.shared_kv_local: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
-
-                def prepare_for_replay(self, h: torch.Tensor, requires_grad: bool) -> None:
-                    self.shared_kv_local = self_outer._materialize_shared_kv_states(shared_kv_states, h.device, None)
-                    if isinstance(layer, _StreamGemmaDecoderLayer):
-                        layer.prepare_for_replay(
-                            h,
-                            position_embeddings[self_outer._layer_types[abs_idx]],
-                            self.shared_kv_local,
-                        )
-
-                def clear_replay_cache(self) -> None:
-                    if isinstance(layer, _StreamGemmaDecoderLayer):
-                        layer.clear_replay_cache()
-                    self.shared_kv_local = None
-
-                def __call__(
-                    self,
-                    h: torch.Tensor,
-                    chunk_range: tuple[int, int] | None = None,
-                ) -> torch.Tensor:
-                    seq_end = None if chunk_range is None else chunk_range[1]
-                    per_layer_input_local = None
-                    if current_per_layer_input_source is not None:
-                        if chunk_range is None:
-                            per_layer_input_local = self_outer._move_tensor(current_per_layer_input_source, h.device)
-                        else:
-                            per_layer_input_local = self_outer._move_tensor(
-                                current_per_layer_input_source[:, chunk_range[0]:chunk_range[1], :],
-                                h.device,
-                            )
-
-                    shared_kv_local = self.shared_kv_local
-                    if shared_kv_local is None:
-                        shared_kv_local = self_outer._materialize_shared_kv_states(shared_kv_states, h.device, seq_end)
-
-                    output = _run_layer(
-                        layer,
-                        h,
-                        mask_mapping,
-                        position_embeddings,
-                        position_ids,
-                        shared_kv_local,
-                        self_outer._layer_types[abs_idx],
-                        per_layer_input=per_layer_input_local,
-                        chunk_range=chunk_range,
-                    )
-                    if seq_end is None or seq_end == h.shape[1]:
-                        for key, value in shared_kv_local.items():
-                            shared_kv_states[key] = value
-                    return output
-
-            self_outer = self
-            layer_replay = _LayerReplay()
+            layer_replay = _LayerReplay(
+                layer,
+                abs_idx,
+                current_per_layer_input_source,
+                self,
+                mask_mapping,
+                position_embeddings,
+                position_ids,
+                shared_kv_states,
+            )
 
             if use_streaming_suffix:
                 hidden_states = _StreamCheckpointFunction.apply(
@@ -964,7 +1075,8 @@ class Gemma4Model(BaseModel):
         token_ids: torch.Tensor,
     ) -> torch.Tensor:
         completion_len = hidden_comp.shape[1]
-        chunk = completion_len if self.chunk_size is None else max(1, int(self.chunk_size))
+        chunk_source = self.logprob_chunk_size if self.logprob_chunk_size is not None else self.chunk_size
+        chunk = completion_len if chunk_source is None else max(1, int(chunk_source))
         softcap = getattr(self._inner_model.config, "final_logit_softcapping", None)
         token_logprob_chunks = []
 
@@ -982,6 +1094,50 @@ class Gemma4Model(BaseModel):
 
         return torch.cat(token_logprob_chunks, dim=1)
 
+    def _backward_masked_mean_logprob_chunked(
+        self,
+        hidden_comp: torch.Tensor,
+        token_ids: torch.Tensor,
+        token_mask: torch.Tensor,
+        *,
+        loss_scale: float,
+    ) -> tuple[float, float]:
+        completion_len = hidden_comp.shape[1]
+        chunk_source = self.logprob_chunk_size if self.logprob_chunk_size is not None else self.chunk_size
+        chunk = completion_len if chunk_source is None else max(1, int(chunk_source))
+        softcap = getattr(self._inner_model.config, "final_logit_softcapping", None)
+        valid_tokens = token_mask.sum().clamp(min=1.0)
+        total_logp_sum = 0.0
+
+        # Detach hidden_comp so lm_head chunk backward does NOT traverse the suffix graph.
+        # Accumulate dL/d_hidden_comp across all chunks, then do ONE backward through suffix.
+        hidden_comp_detach = hidden_comp.detach().requires_grad_(True)
+
+        for start in range(0, completion_len, chunk):
+            end = min(start + chunk, completion_len)
+            logits = self._lm_head(hidden_comp_detach[:, start:end, :])
+            if softcap is not None:
+                logits = torch.tanh(logits / softcap) * softcap
+            target_ids = token_ids[:, start:end].to(hidden_comp.device, non_blocking=True)
+            mask_slice = token_mask[:, start:end]
+            token_logprobs = torch.log_softmax(logits.float(), dim=-1).gather(
+                dim=-1,
+                index=target_ids.unsqueeze(-1),
+            ).squeeze(-1)
+            chunk_loss = -((token_logprobs * mask_slice).sum() / valid_tokens)
+            # backward only through lm_head; gradients accumulate into hidden_comp_detach.grad
+            (chunk_loss * float(loss_scale)).backward()
+            with torch.no_grad():
+                total_logp_sum += float((token_logprobs * mask_slice).sum().item())
+
+        # Single backward through suffix graph with fully accumulated gradient.
+        hidden_comp.backward(gradient=hidden_comp_detach.grad)
+
+        valid_tokens_value = float(valid_tokens.item())
+        mean_logp = total_logp_sum / valid_tokens_value
+        total_loss = -total_logp_sum / valid_tokens_value
+        return total_loss, mean_logp
+
     def forward(self, messages: list[list[dict]]):
         prompts = [
             self.tokenizer.apply_chat_template(
@@ -992,7 +1148,7 @@ class Gemma4Model(BaseModel):
             for convo in messages
         ]
         tokenized = self.tokenizer(prompts, return_tensors="pt", padding=True)
-        model_device = next(self.model.parameters()).device
+        model_device = self._model_device
         input_ids = tokenized["input_ids"].to(model_device, non_blocking=True)
         attention_mask = tokenized["attention_mask"].to(model_device, non_blocking=True)
 
@@ -1019,44 +1175,80 @@ class Gemma4Model(BaseModel):
             )
             for convo in messages
         ]
-        tokenized = self.tokenizer(prompts, return_tensors="pt", padding=True)
-        model_device = next(self.model.parameters()).device
-        prompt_ids = tokenized["input_ids"].to(model_device, non_blocking=True)
-        prompt_mask = tokenized["attention_mask"].to(model_device, non_blocking=True)
-
-        completion_tok = self.tokenizer(
-            completion_texts,
-            return_tensors="pt",
-            padding=True,
-            add_special_tokens=False,
-        )
-        completion_ids = completion_tok["input_ids"].to(model_device, non_blocking=True)
-        completion_mask = completion_tok["attention_mask"].to(
-            model_device,
-            dtype=torch.float32,
-            non_blocking=True,
-        )
-
-        num_generations = completion_ids.shape[0]
-        if prompt_ids.shape[0] == 1 and num_generations > 1:
-            prompt_ids = prompt_ids.expand(num_generations, prompt_ids.shape[1])
-            prompt_mask = prompt_mask.expand(num_generations, prompt_mask.shape[1])
-        if prompt_ids.shape[0] != num_generations:
+        model_device = self._model_device
+        num_generations = len(completion_texts)
+        if len(prompts) == 1 and num_generations > 1:
+            prompts = prompts * num_generations
+        if len(prompts) != num_generations:
             raise ValueError(
-                f"prompt batch ({prompt_ids.shape[0]}) must be 1 or match completion batch ({num_generations})"
+                f"prompt batch ({len(prompts)}) must be 1 or match completion batch ({num_generations})"
             )
 
-        full_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        full_mask = torch.cat([prompt_mask, completion_mask], dim=1)
-        completion_len = completion_ids.shape[1]
+        prompt_token_lists = self.tokenizer(
+            prompts,
+            add_special_tokens=False,
+            return_attention_mask=False,
+        )["input_ids"]
+        completion_token_lists = self.tokenizer(
+            completion_texts,
+            add_special_tokens=False,
+            return_attention_mask=False,
+        )["input_ids"]
+        full_token_lists = [
+            prompt_ids + completion_ids
+            for prompt_ids, completion_ids in zip(prompt_token_lists, completion_token_lists)
+        ]
+        max_total_len = max(len(ids) for ids in full_token_lists)
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            raise ValueError("tokenizer.pad_token_id must be set")
+
+        full_ids_cpu = []
+        full_mask_cpu = []
+        target_ids_cpu = []
+        completion_target_mask_cpu = []
+        for prompt_ids, completion_ids, full_ids_list in zip(
+            prompt_token_lists,
+            completion_token_lists,
+            full_token_lists,
+        ):
+            pad_len = max_total_len - len(full_ids_list)
+            full_ids_cpu.append(full_ids_list + ([pad_token_id] * pad_len))
+            full_mask_cpu.append(([1] * len(full_ids_list)) + ([0] * pad_len))
+            target_ids_cpu.append(full_ids_list[1:] + ([pad_token_id] * (pad_len + 1)))
+            completion_target_mask_cpu.append(
+                ([0] * max(0, len(prompt_ids) - 1))
+                + ([1] * len(completion_ids))
+                + ([0] * pad_len)
+            )
+
+        full_ids = torch.tensor(full_ids_cpu, device=model_device, dtype=torch.long)
+        full_mask = torch.tensor(full_mask_cpu, device=model_device, dtype=torch.long)
+        target_ids = torch.tensor(target_ids_cpu, device=model_device, dtype=torch.long)
+        completion_mask = torch.tensor(
+            completion_target_mask_cpu,
+            device=model_device,
+            dtype=torch.float32,
+        )
 
         with torch.inference_mode():
             prefix_bundle = self._build_prefix_bundle(full_ids, full_mask)
+        # Clone mask/pos_emb out of inference mode so they can participate in autograd graph.
+        if prefix_bundle.mask_mapping is not None:
+            prefix_bundle.mask_mapping = {
+                k: v.clone() if v is not None else None
+                for k, v in prefix_bundle.mask_mapping.items()
+            }
+        if prefix_bundle.position_embeddings is not None:
+            prefix_bundle.position_embeddings = {
+                k: (cos.clone(), sin.clone())
+                for k, (cos, sin) in prefix_bundle.position_embeddings.items()
+            }
 
         with torch.enable_grad():
             hidden_suffix = self._run_suffix_from_prefix_bundle(prefix_bundle, full_mask)
-            hidden_comp = hidden_suffix[:, -(completion_len + 1) : -1, :]
-            batch_logprobs = self._token_logprobs_chunked(hidden_comp, completion_ids)
+            hidden_comp = hidden_suffix[:, :-1, :]
+            batch_logprobs = None
 
             batch_loss_callable = None
             explicit_batch = getattr(loss_fn, "loss_fn_batch", None)
@@ -1065,11 +1257,23 @@ class Gemma4Model(BaseModel):
             elif getattr(loss_fn, "__name__", "") == "loss_fn_batch":
                 batch_loss_callable = loss_fn
 
+            mean_logp = None
             if batch_loss_callable is not None:
-                total_loss_t = batch_loss_callable(batch_logprobs, completion_mask, hidden_comp)
-                (total_loss_t * float(loss_scale)).backward()
-                total_loss = float(total_loss_t.item())
+                stream_mode = getattr(batch_loss_callable, "_streaming_reduction", None)
+                if stream_mode == "masked_mean_logprob":
+                    total_loss, mean_logp = self._backward_masked_mean_logprob_chunked(
+                        hidden_comp,
+                        target_ids,
+                        completion_mask,
+                        loss_scale=float(loss_scale),
+                    )
+                else:
+                    batch_logprobs = self._token_logprobs_chunked(hidden_comp, target_ids)
+                    total_loss_t = batch_loss_callable(batch_logprobs, completion_mask, hidden_comp)
+                    (total_loss_t * float(loss_scale)).backward()
+                    total_loss = float(total_loss_t.item())
             else:
+                batch_logprobs = self._token_logprobs_chunked(hidden_comp, target_ids)
                 total_loss = 0.0
                 for idx in range(num_generations):
                     sample_loss = loss_fn(batch_logprobs[idx], idx, hidden_comp[idx])
@@ -1080,7 +1284,10 @@ class Gemma4Model(BaseModel):
 
         with torch.no_grad():
             valid_tokens = completion_mask.sum().clamp(min=1.0)
-            mean_logp = float((batch_logprobs * completion_mask).sum().item() / valid_tokens.item())
+            if mean_logp is None:
+                if batch_logprobs is None:
+                    batch_logprobs = self._token_logprobs_chunked(hidden_comp, target_ids)
+                mean_logp = float((batch_logprobs * completion_mask).sum().item() / valid_tokens.item())
 
         return {
             "loss": float(total_loss),

@@ -1,19 +1,12 @@
-from __future__ import annotations
-
-import asyncio
 import json
 from pathlib import Path
 
 import torch
 from peft import PeftModel
-from tqdm.asyncio import tqdm as async_tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from inference.vllm_engine import VLLMEngine
 from sft_primer.train import (
     detect_model_family,
-    generate_qa_for_chunk_with_lookbehind,
-    process_input_folder_to_chunks,
     train_model_on_qa_pairs,
 )
 
@@ -22,18 +15,22 @@ from sft_primer.train import (
 # ---------------------------------------------------------------------------
 
 INPUT_FOLDER_PATH      = Path("/media/blazingbhavneek/Common/Code/rl/sft_primer/input/intel")
-MODEL_PATH             = "/media/blazingbhavneek/Common/Code/sglangServer/Infer/Qwen/Qwen3-1.7B"
+MODEL_PATH             = "/media/blazingbhavneek/Common/Code/sglangServer/Infer/google/gemma-4-E2B-it"
 
-QA_PORT                = 30000
-CHUNK_CONCURRENCY      = 10
-TRAIN_EPOCHS           = 15
+TRAIN_EPOCHS           = 5
 TRAIN_LR               = 2e-4
 TRAIN_BATCH_SIZE       = 4
-GRAD_ACCUM_STEPS       = 8
-TRAIN_ON_REASONING     = False
+GRAD_ACCUM_STEPS       = 4
+TRAIN_CHUNK_SIZE       = 256
+TRAIN_LOGPROB_CHUNK    = 128
+TRAIN_TOKEN_CHUNK_SIZE = 128
+OFFLOAD_PREFIX_TO_CPU  = False
+MAX_SAMPLE_TOKENS      = 2048
+TRAIN_ON_REASONING     = True
 INFER_MAX_NEW_TOKENS   = 8192
 GPU_MEMORY_UTILIZATION = 0.90
 SAVE_EVERY_STEPS       = 50           # save LoRA every N optimizer steps; 0 = disabled
+QA_PAIRS_PATH          = Path("/media/blazingbhavneek/Common/Code/rl/sft_primer/output/intel/qa_pair.jsonl")
 
 # ---------------------------------------------------------------------------
 # Hardcoded QA sample — used to sanity-check the pipeline without chunking.
@@ -85,13 +82,15 @@ def _load_qa_pairs(path: Path) -> list[dict]:
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if (
-                isinstance(row, dict)
-                and str(row.get("question", "")).strip()
-                and str(row.get("answer", "")).strip()
-                and str(row.get("reasoning", "")).strip()
-            ):
-                pairs.append(row)
+            if isinstance(row, dict):
+                if "messages" in row and isinstance(row["messages"], list) and len(row["messages"]) >= 2:
+                    pairs.append(row)
+                elif (
+                    str(row.get("question", "")).strip()
+                    and str(row.get("answer", "")).strip()
+                    and str(row.get("reasoning", "")).strip()
+                ):
+                    pairs.append(row)
     return pairs
 
 
@@ -161,8 +160,7 @@ def _compare_base_vs_lora(adapter_dir: str) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
-async def _run() -> None:
-    input_root = str(INPUT_FOLDER_PATH.parent)
+def _run() -> None:
     output_root = str(INPUT_FOLDER_PATH.parent.parent / "output")
     input_folder = INPUT_FOLDER_PATH.name
     model_family = detect_model_family(MODEL_PATH)
@@ -176,8 +174,13 @@ async def _run() -> None:
     print(f"train_lr:              {TRAIN_LR}")
     print(f"train_batch_size:      {TRAIN_BATCH_SIZE}")
     print(f"grad_accum_steps:      {GRAD_ACCUM_STEPS}")
+    print(f"train_chunk_size:      {TRAIN_CHUNK_SIZE}")
+    print(f"logprob_chunk_size:    {TRAIN_LOGPROB_CHUNK}")
+    print(f"train_token_chunk:     {TRAIN_TOKEN_CHUNK_SIZE}")
+    print(f"offload_prefix_cpu:    {OFFLOAD_PREFIX_TO_CPU}")
+    print(f"max_sample_tokens:     {MAX_SAMPLE_TOKENS}")
     print(f"save_every_steps:      {SAVE_EVERY_STEPS}")
-    print(f"qa_port:               {QA_PORT}")
+    print(f"qa_pairs_path:         {QA_PAIRS_PATH}")
 
     if not INPUT_FOLDER_PATH.exists() or not INPUT_FOLDER_PATH.is_dir():
         raise FileNotFoundError(f"Input folder not found: {INPUT_FOLDER_PATH}")
@@ -194,98 +197,11 @@ async def _run() -> None:
         _compare_base_vs_lora(str(final_lora_dir))
         return
 
-    # --- chunks ---
-    out_path = Path(output_root) / input_folder / "chunks.json"
-    if out_path.exists() and out_path.stat().st_size > 0:
-        print(f"chunks_checkpoint_found: {out_path}")
-    else:
-        out_path = process_input_folder_to_chunks(
-            input_folder=input_folder,
-            input_root=input_root,
-            output_root=output_root,
-        )
-    chunks = json.loads(Path(out_path).read_text(encoding="utf-8"))
-    chunk_texts = [
-        str(r.get("text", "")).strip()
-        for r in chunks
-        if str(r.get("text", "")).strip()
-    ]
-    print(f"chunks_count: {len(chunk_texts)}")
-    if not chunk_texts:
-        raise ValueError("No non-empty chunks found.")
-
-    # --- QA pairs ---
-    qa_pairs_path = Path(output_root) / input_folder / "qa_pair.json"
-    qa_pairs = (
-        _load_qa_pairs(qa_pairs_path)
-        if qa_pairs_path.exists() and qa_pairs_path.stat().st_size > 0
-        else []
-    )
-
-    if qa_pairs:
-        print(f"qa_checkpoint_found: {qa_pairs_path} ({len(qa_pairs)} pairs)")
-    else:
-        engine = VLLMEngine(
-            model_path=MODEL_PATH,
-            engine_kwargs={
-                "base_url": f"http://127.0.0.1:{QA_PORT}/v1",
-                "model_name": MODEL_PATH,
-                "api_key": "",
-                "save_vllm_logs": True,
-                "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
-                "reasoning_parser": "qwen3",
-                "enable_auto_tool_choice": True,
-                "tool_call_parser": "hermes",
-            },
-        )
-        try:
-            print("starting_qa_engine...")
-            await engine.start()
-            await engine.init()
-            print("qa_engine_ready")
-
-            sem = asyncio.Semaphore(max(1, CHUNK_CONCURRENCY))
-
-            async def _run_chunk(i: int) -> tuple[int, list[dict]]:
-                async with sem:
-                    try:
-                        rows = await generate_qa_for_chunk_with_lookbehind(
-                            chunks=chunk_texts,
-                            chunk_index=i,
-                            lookbehind_chunks=2,
-                            num_questions=5,
-                            model_path=MODEL_PATH,
-                            port=QA_PORT,
-                        )
-                    except Exception:
-                        return i, []
-                return i, [
-                    r for r in rows
-                    if isinstance(r, dict)
-                    and str(r.get("question", "")).strip()
-                    and str(r.get("answer", "")).strip()
-                    and str(r.get("reasoning", "")).strip()
-                ]
-
-            tasks = [asyncio.create_task(_run_chunk(i)) for i in range(len(chunk_texts))]
-            qa_pairs_path.parent.mkdir(parents=True, exist_ok=True)
-            with qa_pairs_path.open("w", encoding="utf-8") as f:
-                with async_tqdm(total=len(tasks), desc="Generating QA", unit="chunk") as pbar:
-                    for fut in asyncio.as_completed(tasks):
-                        _, rows = await fut
-                        for row in rows:
-                            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-                        f.flush()
-                        pbar.update(1)
-        finally:
-            print("shutting_down_qa_engine...")
-            await engine.shutdown()
-
-        qa_pairs = _load_qa_pairs(qa_pairs_path)
-
+    qa_pairs = _load_qa_pairs(QA_PAIRS_PATH) if QA_PAIRS_PATH.exists() and QA_PAIRS_PATH.stat().st_size > 0 else []
     if not qa_pairs:
-        raise ValueError("No QA pairs could be created from chunks.")
+        raise ValueError(f"No QA pairs found at {QA_PAIRS_PATH}")
 
+    print(f"qa_pairs_found:        {QA_PAIRS_PATH} ({len(qa_pairs)} pairs)")
     qa_pairs.insert(0, LLVM_QA_SAMPLE)
     print(f"qa_pairs_count: {len(qa_pairs)} (includes 1 hardcoded LLVM sample)")
 
@@ -299,6 +215,11 @@ async def _run() -> None:
         lr=TRAIN_LR,
         train_batch_size=TRAIN_BATCH_SIZE,
         grad_accum_steps=GRAD_ACCUM_STEPS,
+        chunk_size=TRAIN_CHUNK_SIZE,
+        logprob_chunk_size=TRAIN_LOGPROB_CHUNK,
+        token_chunk_size=TRAIN_TOKEN_CHUNK_SIZE,
+        offload_prefix_to_cpu=OFFLOAD_PREFIX_TO_CPU,
+        max_sample_tokens=MAX_SAMPLE_TOKENS,
         train_on_reasoning=TRAIN_ON_REASONING,
         save_every_steps=SAVE_EVERY_STEPS,
     )
@@ -312,4 +233,4 @@ async def _run() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(_run())
+    _run()

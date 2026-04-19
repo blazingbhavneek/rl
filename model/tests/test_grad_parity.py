@@ -217,7 +217,7 @@ def run_grad_parity(
         prefix_handle.remove()
 
         with torch.inference_mode():
-            custom_prefix_hidden, _, _, _ = baseline_model._forward_prefix(full_ids, full_mask)
+            custom_prefix_hidden, _, _, _, _, _ = baseline_model._forward_prefix(full_ids, full_mask)
         prefix_max_abs_diff, prefix_mean_abs_diff, prefix_rel_l2 = _tensor_diff_stats(
             hf_prefix_cache["hidden"],
             custom_prefix_hidden,
@@ -270,7 +270,7 @@ def run_grad_parity(
 
     # Custom path, but with logits-based backward to match HF loss construction exactly.
     with torch.inference_mode():
-        hidden_prefix, pos_ids, shared_kv_states, per_layer_inputs = custom_model._forward_prefix(
+        hidden_prefix, pos_ids, shared_kv_states, per_layer_inputs, _, _ = custom_model._forward_prefix(
             full_ids,
             full_mask,
         )

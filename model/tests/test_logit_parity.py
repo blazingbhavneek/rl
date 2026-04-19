@@ -118,7 +118,7 @@ def run_logit_parity(
     print(f"[parity] hf-style forward done in {time.perf_counter() - t_hf:.2f}s")
 
     with torch.inference_mode():
-        custom_prefix_hidden, _, _, _ = custom_model._forward_prefix(
+        custom_prefix_hidden, _, _, _, _, _ = custom_model._forward_prefix(
             input_ids, attention_mask
         )
 
