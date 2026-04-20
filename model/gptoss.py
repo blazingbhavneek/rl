@@ -37,10 +37,10 @@ class GptOssModel(BaseModel):
         # region LoRA Config Input and Target Discovery
 
         # Read LoRA target selection controls from config.
-        
+
         self.lora = getattr(self.config, "lora")
         self.lora_fraction = getattr(self.config, "lora_fraction")
-        
+
         # Split requested targets into PEFT module targets vs parameter targets.
         # Why: attention projections and MoE expert tensors are attached differently in PEFT.
         base = self.model
@@ -61,10 +61,10 @@ class GptOssModel(BaseModel):
         # region LoRA Attach
 
         # Build PEFT LoRA config and wrap the base model.
-        
+
         lora_rank = int(getattr(self.config, "lora_rank", 128))
         lora_alpha = int(getattr(self.config, "lora_alpha", lora_rank * 2))
-        
+
         lora_cfg = LoraConfig(
             r=lora_rank,
             lora_alpha=lora_alpha,
@@ -74,9 +74,9 @@ class GptOssModel(BaseModel):
             target_modules=target_modules,
             target_parameters=expert_param_targets,
         )
-        
+
         self.model = get_peft_model(base, lora_cfg)
-        
+
         # endregion
 
         # region Prefix/Suffix Partition
@@ -106,7 +106,8 @@ class GptOssModel(BaseModel):
         )
         self._layer_types = list(getattr(self._inner_model.config, "layer_types", []))
         self._suffix_layer_types = {
-            self._prefix_split_layer + i: (
+            self._prefix_split_layer
+            + i: (
                 self._layer_types[self._prefix_split_layer + i]
                 if (self._prefix_split_layer + i) < len(self._layer_types)
                 else "full_attention"
@@ -114,7 +115,9 @@ class GptOssModel(BaseModel):
             for i in range(len(self._suffix_layers))
         }
         self._prefix_layer_types = {
-            i: (self._layer_types[i] if i < len(self._layer_types) else "full_attention")
+            i: (
+                self._layer_types[i] if i < len(self._layer_types) else "full_attention"
+            )
             for i in range(len(self._prefix_layers))
         }
 
@@ -124,14 +127,14 @@ class GptOssModel(BaseModel):
         )
 
         self._compiled_prefix_depth = self._prefix_split_layer
-        
+
         # endregion
 
         # region Prefix Runner Build
 
         # Build callable that runs only prefix subset.
         # Why: keeping this isolated allows future compile/wrapping without touching suffix code.
-        
+
         def _prefix_body(
             hidden_states: torch.Tensor,
             full_attention_mask: torch.Tensor,
@@ -278,7 +281,7 @@ class GptOssModel(BaseModel):
           Example at H=4096: 1 * 132000 * 4096 * 2 = 1,081,344,000 bytes (~1.01 GiB).
         - Position ids use int64: B * T * 8 bytes (~1.01 MiB), typically negligible vs hidden.
         """
-        
+
         # 1) Build inputs_embeds from embed_tokens.
         hidden_states = self._inner_model.embed_tokens(input_ids)
 
@@ -292,7 +295,10 @@ class GptOssModel(BaseModel):
 
         # Match HF GPT-OSS masking contract for per-layer attention type selection.
         # Why: full/sliding layer masks must match HF exactly for boundary/logit parity.
-        from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+        from transformers.masking_utils import (
+            create_causal_mask,
+            create_sliding_window_causal_mask,
+        )
 
         mask_kwargs = {
             "config": self._inner_model.config,
@@ -397,7 +403,10 @@ class GptOssModel(BaseModel):
 
         # Build the same mask mapping used by HF GPT-OSS forward.
         # Why: suffix parity breaks if full/sliding masks are not routed exactly per layer type.
-        from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+        from transformers.masking_utils import (
+            create_causal_mask,
+            create_sliding_window_causal_mask,
+        )
 
         mask_kwargs = {
             "config": self._inner_model.config,
@@ -414,7 +423,9 @@ class GptOssModel(BaseModel):
         for i, layer in enumerate(self._suffix_layers):
             abs_idx = self._prefix_split_layer + i
             layer_type = self._suffix_layer_types.get(abs_idx, "full_attention")
-            layer_mask = causal_mask_mapping.get(layer_type, causal_mask_mapping["full_attention"])
+            layer_mask = causal_mask_mapping.get(
+                layer_type, causal_mask_mapping["full_attention"]
+            )
 
             # Optional checkpointing: lower activation memory, higher recompute cost.
             if self._use_grad_checkpoint and torch.is_grad_enabled():

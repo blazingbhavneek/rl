@@ -10,7 +10,7 @@ from .dataset import BUCKET_RANGES, CURRICULUM_BUCKET_FILES, encode_tcs
 
 def ngrams(text: str, n: int = 8) -> Set[Tuple[str, ...]]:
     words = text.lower().split()
-    return {tuple(words[i:i + n]) for i in range(len(words) - n + 1)}
+    return {tuple(words[i : i + n]) for i in range(len(words) - n + 1)}
 
 
 def build_eval_ngrams(eval_problems: List[Dict], n: int = 8) -> Set[Tuple[str, ...]]:
@@ -20,7 +20,9 @@ def build_eval_ngrams(eval_problems: List[Dict], n: int = 8) -> Set[Tuple[str, .
     return out
 
 
-def contaminated(text: str, eval_ngrams: Set[Tuple[str, ...]], n: int = 8, threshold: int = 3) -> bool:
+def contaminated(
+    text: str, eval_ngrams: Set[Tuple[str, ...]], n: int = 8, threshold: int = 3
+) -> bool:
     return len(ngrams(text, n=n) & eval_ngrams) >= threshold
 
 
@@ -113,11 +115,15 @@ def build(
 
         contest_id = str(row.get("contestId", "")).strip()
         index = str(row.get("index", "")).strip()
-        pid = f"{contest_id}_{index}" if contest_id and index else str(row.get("id", ""))
+        pid = (
+            f"{contest_id}_{index}" if contest_id and index else str(row.get("id", ""))
+        )
         if not pid or pid in eval_ids:
             continue
 
-        if decontam and contaminated(statement, eval_grams, n=decontam_n, threshold=decontam_threshold):
+        if decontam and contaminated(
+            statement, eval_grams, n=decontam_n, threshold=decontam_threshold
+        ):
             dropped += 1
             continue
 
@@ -174,8 +180,12 @@ def build(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build bucketed Codeforces dataset for tasksets")
-    parser.add_argument("--out-dir", type=str, default=str(Path(__file__).parent / "data"))
+    parser = argparse.ArgumentParser(
+        description="Build bucketed Codeforces dataset for tasksets"
+    )
+    parser.add_argument(
+        "--out-dir", type=str, default=str(Path(__file__).parent / "data")
+    )
     parser.add_argument("--max-cf", type=int, default=5000)
     parser.add_argument("--min-cf-rating", type=int, default=800)
     parser.add_argument("--max-cf-rating", type=int, default=2500)

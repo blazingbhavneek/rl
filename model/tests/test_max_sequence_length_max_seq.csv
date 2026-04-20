@@ -1,5 +1,0 @@
-label,batch_size,max_seq_len,max_batch_tokens,peak_cuda_mb,time_s
-streaming-b1,1,36608,36608,13894.8,32.08
-streaming-b4,4,9984,39936,14458.2,22.21
-standard-b1,1,5632,5632,14437.2,3.44
-standard-b4,4,2048,8192,14057.1,4.05

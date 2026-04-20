@@ -4,17 +4,17 @@ import warnings
 import torch
 
 from model.config import ModelConfig
-from model.gemma4 import (
-    Gemma4Model,
-    _apply_rotary_pos_emb,
-    _make_chunk_attention_mask,
-    _run_layer,
-    _stream_attention_forward,
-)
+from model.gemma4 import Gemma4Model
 from model.tests.test_max_sequence_length import (
     DEFAULT_GEMMA4_LORA_TARGETS,
     DEFAULT_GEMMA4_MODEL_PATH,
     _make_sample,
+)
+from model.utils.attn import apply_rotary_pos_emb as _apply_rotary_pos_emb
+from model.utils.gemma4_streaming import (
+    _make_chunk_attention_mask,
+    _run_layer,
+    _stream_attention_forward,
 )
 
 warnings.filterwarnings(
@@ -43,16 +43,24 @@ def _build_config() -> ModelConfig:
     )
 
 
-def _build_full_inputs(model: Gemma4Model, target_total_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _build_full_inputs(
+    model: Gemma4Model, target_total_tokens: int
+) -> tuple[torch.Tensor, torch.Tensor]:
     messages, completion_text = _make_sample(model.tokenizer, target_total_tokens)
-    prompt = model.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    prompt_ids = model.tokenizer(prompt, add_special_tokens=False, return_attention_mask=False)["input_ids"]
+    prompt = model.tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    prompt_ids = model.tokenizer(
+        prompt, add_special_tokens=False, return_attention_mask=False
+    )["input_ids"]
     completion_ids = model.tokenizer(
         completion_text,
         add_special_tokens=False,
         return_attention_mask=False,
     )["input_ids"]
-    full_ids = torch.tensor([prompt_ids + completion_ids], device=model._model_device, dtype=torch.long)
+    full_ids = torch.tensor(
+        [prompt_ids + completion_ids], device=model._model_device, dtype=torch.long
+    )
     full_mask = torch.ones_like(full_ids)
     return full_ids, full_mask
 
@@ -70,7 +78,9 @@ def _find_target_layers(model: Gemma4Model) -> tuple[int, int]:
             shared_idx = idx
         if direct_idx >= 0 and shared_idx >= 0:
             return direct_idx, shared_idx
-    raise AssertionError("could not find both direct and shared sliding-attention layers")
+    raise AssertionError(
+        "could not find both direct and shared sliding-attention layers"
+    )
 
 
 def _prepare_layer_inputs(
@@ -78,7 +88,9 @@ def _prepare_layer_inputs(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     target_layer_idx: int,
-) -> tuple[torch.Tensor, torch.Tensor, dict[int, tuple[torch.Tensor, torch.Tensor]], dict, dict]:
+) -> tuple[
+    torch.Tensor, torch.Tensor, dict[int, tuple[torch.Tensor, torch.Tensor]], dict, dict
+]:
     batch_size, seq_len = input_ids.shape
     hidden_states = model._inner_model.embed_tokens(input_ids)
     position_ids = (
@@ -95,10 +107,14 @@ def _prepare_layer_inputs(
 
     shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
     raw_per_layer_inputs = model._get_per_layer_inputs(input_ids)
-    per_layer_inputs = model._project_per_layer_inputs(hidden_states, raw_per_layer_inputs)
+    per_layer_inputs = model._project_per_layer_inputs(
+        hidden_states, raw_per_layer_inputs
+    )
 
     for idx in range(target_layer_idx):
-        per_layer_input = per_layer_inputs[:, :, idx, :] if per_layer_inputs is not None else None
+        per_layer_input = (
+            per_layer_inputs[:, :, idx, :] if per_layer_inputs is not None else None
+        )
         hidden_states = _run_layer(
             model._layers[idx],
             hidden_states,
@@ -110,7 +126,13 @@ def _prepare_layer_inputs(
             per_layer_input=per_layer_input,
         )
 
-    return hidden_states, position_ids, shared_kv_states, mask_mapping, position_embeddings
+    return (
+        hidden_states,
+        position_ids,
+        shared_kv_states,
+        mask_mapping,
+        position_embeddings,
+    )
 
 
 def _reference_full_kv_attention(
@@ -126,7 +148,9 @@ def _reference_full_kv_attention(
     batch_size = hidden_states_norm.shape[0]
     chunk_len = end - start
     cos, sin = position_embeddings
-    query_states = attn.q_proj(hidden_states_norm[:, start:end, :]).view(batch_size, chunk_len, -1, attn.head_dim)
+    query_states = attn.q_proj(hidden_states_norm[:, start:end, :]).view(
+        batch_size, chunk_len, -1, attn.head_dim
+    )
     query_states = attn.q_norm(query_states)
     query_states = _apply_rotary_pos_emb(
         query_states,
@@ -190,11 +214,13 @@ def run_sliding_window_chunking_test(model_path: str) -> None:
 
     with torch.inference_mode():
         for label, layer_idx in cases:
-            hidden_states, _, shared_kv_states, _, position_embeddings = _prepare_layer_inputs(
-                model,
-                input_ids,
-                attention_mask,
-                layer_idx,
+            hidden_states, _, shared_kv_states, _, position_embeddings = (
+                _prepare_layer_inputs(
+                    model,
+                    input_ids,
+                    attention_mask,
+                    layer_idx,
+                )
             )
             layer = model._layers[layer_idx]
             attn = layer.base_layer.self_attn
@@ -212,13 +238,17 @@ def run_sliding_window_chunking_test(model_path: str) -> None:
                 )
                 current, _ = attn(
                     hidden_states=hidden_states_norm,
-                    position_embeddings=position_embeddings[model._layer_types[layer_idx]],
+                    position_embeddings=position_embeddings[
+                        model._layer_types[layer_idx]
+                    ],
                     attention_mask=attention_mask,
                     shared_kv_states=shared_kv_states,
                     chunk_range=(start, end),
                     full_hidden_seq_len=hidden_states.shape[1],
                 )
-                max_abs_diff = float((reference.float() - current.float()).abs().max().item())
+                max_abs_diff = float(
+                    (reference.float() - current.float()).abs().max().item()
+                )
                 print(
                     f"[sliding-chunk] case={label} layer={layer_idx} "
                     f"start={start} end={end} max_abs_diff={max_abs_diff:.6f}"

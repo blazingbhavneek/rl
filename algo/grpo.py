@@ -99,9 +99,19 @@ class GRPOAlgo(BaseAlgo):
 
         stats = {
             "mean_reward": float(rewards_t.mean().item()) if rewards_t.numel() else 0.0,
-            "std_reward": float(rewards_t.std(unbiased=False).item()) if rewards_t.numel() else 0.0,
-            "mean_advantage": float(advantages.mean().item()) if advantages.numel() else 0.0,
-            "std_advantage": float(advantages.std(unbiased=False).item()) if advantages.numel() else 0.0,
+            "std_reward": (
+                float(rewards_t.std(unbiased=False).item())
+                if rewards_t.numel()
+                else 0.0
+            ),
+            "mean_advantage": (
+                float(advantages.mean().item()) if advantages.numel() else 0.0
+            ),
+            "std_advantage": (
+                float(advantages.std(unbiased=False).item())
+                if advantages.numel()
+                else 0.0
+            ),
         }
         return AlgoOutput(
             loss_fn=loss_fn,
@@ -115,7 +125,9 @@ class GRPOAlgo(BaseAlgo):
         advantages: Tensor,  # (G,)
         completion_mask: Tensor,  # (G, T_c)
     ) -> Callable[[Tensor, int, Optional[Tensor]], Tensor]:
-        def loss_fn(log_probs: Tensor, gen_idx: int, hidden_comp: Optional[Tensor] = None) -> Tensor:
+        def loss_fn(
+            log_probs: Tensor, gen_idx: int, hidden_comp: Optional[Tensor] = None
+        ) -> Tensor:
             del hidden_comp
             g_adv = advantages[gen_idx].to(log_probs.device, non_blocking=True)
             g_mask = completion_mask[gen_idx].to(log_probs.device, non_blocking=True)
@@ -123,7 +135,9 @@ class GRPOAlgo(BaseAlgo):
 
             if self._old_logprobs is not None:
                 # PPO-style clipped policy-ratio objective over sampled completion tokens.
-                old_lp = self._old_logprobs[gen_idx].to(log_probs.device, non_blocking=True)
+                old_lp = self._old_logprobs[gen_idx].to(
+                    log_probs.device, non_blocking=True
+                )
                 ratio = torch.exp(log_probs - old_lp)
                 clipped_ratio = apply_ppo_clip(
                     ratio=ratio,
@@ -139,8 +153,12 @@ class GRPOAlgo(BaseAlgo):
 
             kl_term = torch.zeros((), device=log_probs.device, dtype=log_probs.dtype)
             if self._ref_logprobs is not None:
-                ref_lp = self._ref_logprobs[gen_idx].to(log_probs.device, non_blocking=True)
-                kl_term = compute_kl_penalty(log_probs.detach(), ref_lp, g_mask).to(log_probs.dtype)
+                ref_lp = self._ref_logprobs[gen_idx].to(
+                    log_probs.device, non_blocking=True
+                )
+                kl_term = compute_kl_penalty(log_probs.detach(), ref_lp, g_mask).to(
+                    log_probs.dtype
+                )
             return pg_term + (self.config.kl_coeff * kl_term)
 
         def loss_fn_batch(

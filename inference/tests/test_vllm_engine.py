@@ -18,14 +18,20 @@ LORA_ADAPTERS = [
 LORA_EVAL_PROMPT = "SYCLの簡単な配列初期化サンプルで `constexpr int num` の値はいくつ？数字だけ答えて。"
 
 
-async def chat(engine: VLLMEngine, prompt: str, thinking: bool = True) -> tuple[str, str]:
-    resp = await engine._request_json("POST", "/chat/completions", {
-        "model": engine.model_name,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.0,
-        "stream": False,
-        "chat_template_kwargs": {"enable_thinking": thinking},
-    })
+async def chat(
+    engine: VLLMEngine, prompt: str, thinking: bool = True
+) -> tuple[str, str]:
+    resp = await engine._request_json(
+        "POST",
+        "/chat/completions",
+        {
+            "model": engine.model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.0,
+            "stream": False,
+            "chat_template_kwargs": {"enable_thinking": thinking},
+        },
+    )
     msg = (resp.get("choices") or [{}])[0].get("message") or {}
     content = (msg.get("content") or "").strip()
     reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
@@ -35,8 +41,12 @@ async def chat(engine: VLLMEngine, prompt: str, thinking: bool = True) -> tuple[
 async def test_lifecycle(engine: VLLMEngine) -> None:
     print("\n--- lifecycle ---")
 
-    content, reasoning = await chat(engine, "What is AI? Think carefully first.", thinking=True)
-    print(f"[thinking=on]  reasoning={repr(reasoning[:80])}  content={repr(content[:80])}")
+    content, reasoning = await chat(
+        engine, "What is AI? Think carefully first.", thinking=True
+    )
+    print(
+        f"[thinking=on]  reasoning={repr(reasoning[:80])}  content={repr(content[:80])}"
+    )
     assert content or reasoning
 
     content, _ = await chat(engine, "What is 2+2? One short line.", thinking=False)
@@ -83,7 +93,9 @@ async def test_lora_swap(engine: VLLMEngine) -> None:
         await engine.swap_lora_adapter(lora_name=name)
         models = await engine._request_json("GET", "/models")
         ids = [str(r.get("id", "")) for r in (models.get("data") or [])]
-        assert not any(name in i for i in ids), f"adapter still loaded after unload: {name}"
+        assert not any(
+            name in i for i in ids
+        ), f"adapter still loaded after unload: {name}"
         print(f"[{name}] unloaded ok")
 
 

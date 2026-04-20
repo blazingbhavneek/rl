@@ -1,6 +1,7 @@
+import gc
 import time
 import warnings
-import gc
+
 import torch
 
 from model.config import ModelConfig
@@ -21,7 +22,9 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-DEFAULT_GEMMA4_MODEL_PATH = "/media/blazingbhavneek/Common/Code/sglangServer/Infer/google/gemma-4-E2B-it"
+DEFAULT_GEMMA4_MODEL_PATH = (
+    "/media/blazingbhavneek/Common/Code/sglangServer/Infer/google/gemma-4-E2B-it"
+)
 DEFAULT_GEMMA4_LORA_TARGETS = [
     "q_proj",
     "k_proj",
@@ -33,7 +36,9 @@ DEFAULT_GEMMA4_LORA_TARGETS = [
 ]
 
 
-def _tensor_diff_stats(ref: torch.Tensor, cur: torch.Tensor) -> tuple[float, float, float]:
+def _tensor_diff_stats(
+    ref: torch.Tensor, cur: torch.Tensor
+) -> tuple[float, float, float]:
     ref_f = ref.detach().float()
     cur_f = cur.detach().float()
     diff = ref_f - cur_f
@@ -77,7 +82,9 @@ def _force_qwen_torch_linear_attention_kernels(model: torch.nn.Module) -> None:
             )
 
 
-def _build_test_config(lora_targets: list[str], *, chunk_size: int, use_grad_checkpoint: bool) -> ModelConfig:
+def _build_test_config(
+    lora_targets: list[str], *, chunk_size: int, use_grad_checkpoint: bool
+) -> ModelConfig:
     return ModelConfig(
         lora=lora_targets,
         lora_fraction=0.25,
@@ -101,7 +108,10 @@ def _capture_suffix_grad_outputs(
     captured: dict[int, torch.Tensor] = {}
     handles: list[torch.utils.hooks.RemovableHandle] = []
 
-    for abs_idx, layer in enumerate(layers[prefix_split_layer:], start=prefix_split_layer):
+    for abs_idx, layer in enumerate(
+        layers[prefix_split_layer:], start=prefix_split_layer
+    ):
+
         def _hook(_module, grad_input, grad_output, *, _abs_idx=abs_idx):
             grad_tuple = grad_output if capture == "output" else grad_input
             if not grad_tuple:
@@ -116,9 +126,7 @@ def _capture_suffix_grad_outputs(
     return captured, handles
 
 
-def run_grad_parity(
-    model_path: str, model_cls: type, lora_targets: list[str]
-) -> None:
+def run_grad_parity(model_path: str, model_cls: type, lora_targets: list[str]) -> None:
     t0 = time.perf_counter()
 
     print("[grad-parity] building config")
@@ -151,7 +159,9 @@ def run_grad_parity(
     baseline_model.model.eval()
     if model_cls.__name__ == "Qwen3_5Model":
         _force_qwen_torch_linear_attention_kernels(baseline_model.model)
-    print(f"[grad-parity] baseline model loaded in {time.perf_counter() - t_load0:.2f}s")
+    print(
+        f"[grad-parity] baseline model loaded in {time.perf_counter() - t_load0:.2f}s"
+    )
 
     print("[grad-parity] loading tokenizer")
     tokenizer = baseline_model.tokenizer
@@ -209,15 +219,16 @@ def run_grad_parity(
             hidden = output[0] if isinstance(output, tuple) else output
             hf_prefix_cache["hidden"] = hidden.detach().float().clone()
 
-        prefix_handle = baseline_model._layers[prefix_split_layer - 1].register_forward_hook(
-            _capture_prefix_boundary
-        )
+        prefix_handle = baseline_model._layers[
+            prefix_split_layer - 1
+        ].register_forward_hook(_capture_prefix_boundary)
         _zero_all_grads(baseline_model.model)
         _ = baseline_model.model(input_ids=full_ids, attention_mask=full_mask).logits
         prefix_handle.remove()
 
         with torch.inference_mode():
-            custom_prefix_hidden, _, _, _, _, _ = baseline_model._forward_prefix(full_ids, full_mask)
+            prefix_bundle = baseline_model._build_prefix_bundle(full_ids, full_mask)
+            custom_prefix_hidden = prefix_bundle.hidden_prefix
         prefix_max_abs_diff, prefix_mean_abs_diff, prefix_rel_l2 = _tensor_diff_stats(
             hf_prefix_cache["hidden"],
             custom_prefix_hidden,
@@ -241,7 +252,7 @@ def run_grad_parity(
     )
     out = baseline_model.model(input_ids=full_ids, attention_mask=full_mask).logits
     # Align with the actual training objective: logits at position t predict token t+1.
-    logits_comp = out[:, -(completion_len + 1):-1, :]
+    logits_comp = out[:, -(completion_len + 1) : -1, :]
     token_logprobs = (
         torch.log_softmax(logits_comp.float(), dim=-1)
         .gather(
@@ -270,30 +281,38 @@ def run_grad_parity(
 
     # Custom path, but with logits-based backward to match HF loss construction exactly.
     with torch.inference_mode():
-        hidden_prefix, pos_ids, shared_kv_states, per_layer_inputs, _, _ = custom_model._forward_prefix(
-            full_ids,
-            full_mask,
-        )
-    hidden_for_suffix = hidden_prefix.clone().detach().requires_grad_(True)
-    pos_for_suffix = pos_ids.clone().detach()
-    shared_kv_for_suffix = custom_model._detach_shared_kv_states(shared_kv_states)
+        prefix_bundle = custom_model._build_prefix_bundle(full_ids, full_mask)
+    hidden_for_suffix = (
+        prefix_bundle.hidden_prefix.clone().detach().requires_grad_(True)
+    )
+    pos_for_suffix = prefix_bundle.position_ids.clone().detach()
+    shared_kv_for_suffix = {
+        key: (key_states.clone().detach(), value_states.clone().detach())
+        for key, (key_states, value_states) in prefix_bundle.shared_kv_states.items()
+    }
     per_layer_inputs_for_suffix = (
-        per_layer_inputs.clone().detach() if per_layer_inputs is not None else None
+        prefix_bundle.per_layer_inputs.clone().detach()
+        if prefix_bundle.per_layer_inputs is not None
+        else None
     )
 
     custom_suffix_grad_outputs, custom_grad_handles = _capture_suffix_grad_outputs(
         custom_model._layers,
         prefix_split_layer,
     )
-    hidden_suffix = custom_model._forward_suffix(
-        hidden_for_suffix,
-        pos_for_suffix,
-        full_mask,
-        shared_kv_for_suffix,
-        per_layer_inputs_for_suffix,
+    suffix_bundle = type(prefix_bundle)(
+        hidden_prefix=hidden_for_suffix,
+        position_ids=pos_for_suffix,
+        shared_kv_states=shared_kv_for_suffix,
+        per_layer_inputs=per_layer_inputs_for_suffix,
+        mask_mapping=prefix_bundle.mask_mapping,
+        position_embeddings=prefix_bundle.position_embeddings,
+    )
+    hidden_suffix = custom_model._run_suffix_from_prefix_bundle(
+        suffix_bundle, full_mask
     )
     custom_logits = custom_model._lm_head_logits_chunked(hidden_suffix)
-    custom_logits_comp = custom_logits[:, -(completion_len + 1):-1, :]
+    custom_logits_comp = custom_logits[:, -(completion_len + 1) : -1, :]
     custom_token_logprobs = (
         torch.log_softmax(custom_logits_comp.float(), dim=-1)
         .gather(
@@ -328,9 +347,11 @@ def run_grad_parity(
                 f"hf={hf_boundary_grad is not None} custom={custom_boundary_grad is not None}"
             )
         else:
-            boundary_max_abs_diff, boundary_mean_abs_diff, boundary_rel_l2 = _tensor_diff_stats(
-                hf_boundary_grad,
-                custom_boundary_grad,
+            boundary_max_abs_diff, boundary_mean_abs_diff, boundary_rel_l2 = (
+                _tensor_diff_stats(
+                    hf_boundary_grad,
+                    custom_boundary_grad,
+                )
             )
             print(
                 f"[boundary-grad] suffix_layer=0 abs={prefix_split_layer} "
@@ -361,7 +382,9 @@ def run_grad_parity(
             f"(abs={abs_idx}) grad_out max_abs_diff={layer_max_abs_diff:.6f} "
             f"rel_l2={layer_rel_l2:.6e}"
         )
-        if first_divergent_layer is None and (layer_max_abs_diff > 1e-5 or layer_rel_l2 > 1e-5):
+        if first_divergent_layer is None and (
+            layer_max_abs_diff > 1e-5 or layer_rel_l2 > 1e-5
+        ):
             first_divergent_layer = abs_idx
 
     if first_divergent_layer is None:
@@ -405,7 +428,7 @@ def run_grad_parity(
     mean_abs_diff = mean_abs_diff / max(1, n)
     mean_rel_diff = mean_rel_diff / max(1, n)
     mean_rel_diff_masked = mean_rel_diff_masked / max(1, n)
-    rel_l2 = (sq_diff ** 0.5) / max(1e-12, sq_ref ** 0.5)
+    rel_l2 = (sq_diff**0.5) / max(1e-12, sq_ref**0.5)
 
     print(
         f"[grad-parity] peft_params={n} "
@@ -418,9 +441,13 @@ def run_grad_parity(
     print(f"[grad-parity] total elapsed={time.perf_counter() - t0:.2f}s")
 
     # PEFT parity: use stable metrics across all trainable adapter params.
-    assert mean_abs_diff < abs_tolerance, f"PEFT grad parity failed: mean_abs_diff={mean_abs_diff}"
+    assert (
+        mean_abs_diff < abs_tolerance
+    ), f"PEFT grad parity failed: mean_abs_diff={mean_abs_diff}"
     assert rel_l2 < rel_l2_tolerance, f"PEFT grad parity failed: rel_l2={rel_l2}"
-    assert mean_rel_diff_masked < rel_tolerance, f"PEFT grad parity failed: mean_rel_diff_masked={mean_rel_diff_masked}"
+    assert (
+        mean_rel_diff_masked < rel_tolerance
+    ), f"PEFT grad parity failed: mean_rel_diff_masked={mean_rel_diff_masked}"
     del baseline_model
     del custom_model
     if torch.cuda.is_available():

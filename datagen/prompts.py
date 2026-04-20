@@ -96,6 +96,7 @@ a comment block listing the remaining compiler errors.
 
 # ─── b0-b3 single-agent prompts ──────────────────────────────────────────
 
+
 def b0_prompt(full_json: str) -> str:
     return f"""\
 You are a C code writer for a proprietary C library.

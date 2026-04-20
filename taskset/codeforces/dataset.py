@@ -6,8 +6,7 @@ import zlib
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-from ..base import Problem, BaseDataset
-
+from ..base import BaseDataset, Problem
 
 BUCKET_RANGES = [
     (0, 800, "b0_unrated"),
@@ -26,7 +25,9 @@ CURRICULUM_BUCKET_FILES = ["b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8", "b9"]
 
 
 def encode_tcs(tcs: List[Dict]) -> str:
-    return base64.b64encode(zlib.compress(pickle.dumps(json.dumps(tcs)))).decode("utf-8")
+    return base64.b64encode(zlib.compress(pickle.dumps(json.dumps(tcs)))).decode(
+        "utf-8"
+    )
 
 
 def decode_tcs(raw: str) -> List[Dict]:
@@ -47,7 +48,7 @@ def decode_tcs(raw: str) -> List[Dict]:
 
 def _ngrams(text: str, n: int = 8) -> Set[Tuple[str, ...]]:
     words = text.lower().split()
-    return {tuple(words[i:i + n]) for i in range(len(words) - n + 1)}
+    return {tuple(words[i : i + n]) for i in range(len(words) - n + 1)}
 
 
 class CodeforcesDataset(BaseDataset):
@@ -59,7 +60,9 @@ class CodeforcesDataset(BaseDataset):
     ) -> None:
         self.data_dir = Path(data_dir)
         self.decontaminate = decontaminate
-        self.livecodebench_path = Path(livecodebench_path) if livecodebench_path else None
+        self.livecodebench_path = (
+            Path(livecodebench_path) if livecodebench_path else None
+        )
 
         self._bucket_cache: Dict[int, List[Problem]] = {}
         self._problem_to_bucket: Dict[str, int] = {}
@@ -92,7 +95,9 @@ class CodeforcesDataset(BaseDataset):
                     pid = row.get("question_id") or row.get("id")
                     statement = row.get("question_content") or row.get("statement", "")
                     encoded = row.get("private_test_cases", "")
-                    test_cases = decode_tcs(encoded) if encoded else row.get("test_cases", [])
+                    test_cases = (
+                        decode_tcs(encoded) if encoded else row.get("test_cases", [])
+                    )
                     metadata = dict(row)
                     metadata["test_cases"] = test_cases
 
@@ -126,7 +131,9 @@ class CodeforcesDataset(BaseDataset):
                 pid = row.get("question_id") or row.get("id")
                 statement = row.get("question_content") or row.get("statement", "")
                 encoded = row.get("private_test_cases", "")
-                test_cases = decode_tcs(encoded) if encoded else row.get("test_cases", [])
+                test_cases = (
+                    decode_tcs(encoded) if encoded else row.get("test_cases", [])
+                )
                 metadata = dict(row)
                 metadata["test_cases"] = test_cases
                 out.append(
@@ -196,7 +203,9 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="CodeforcesDataset smoke test")
-    parser.add_argument("--data-dir", type=str, default=str(Path(__file__).parent / "data"))
+    parser.add_argument(
+        "--data-dir", type=str, default=str(Path(__file__).parent / "data")
+    )
     parser.add_argument("--decontam", action="store_true")
     parser.add_argument("--livecodebench-path", type=str, default=None)
     args = parser.parse_args()
@@ -217,4 +226,6 @@ if __name__ == "__main__":
             continue
         p = b[0]
         tc_count = len(p.metadata.get("test_cases", []))
-        print(f"sample bucket={idx} id={p.id} statement_chars={len(p.statement)} tests={tc_count}")
+        print(
+            f"sample bucket={idx} id={p.id} statement_chars={len(p.statement)} tests={tc_count}"
+        )

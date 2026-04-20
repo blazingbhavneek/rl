@@ -1,7 +1,6 @@
 import argparse
 import random
-from collections import Counter
-from collections import deque
+from collections import Counter, deque
 from pathlib import Path
 from typing import Dict, List
 
@@ -50,14 +49,16 @@ def skill_from_phase(step: int, top_reached_step: int, scenario: str) -> float:
 def simulate_rewards(batch, skill: float, rng: random.Random) -> List[Score]:
     scores: List[Score] = []
     for p in batch:
-        solve_prob = max(0.01, min(0.99, skill - 0.055 * p.bucket + rng.uniform(-0.05, 0.05)))
+        solve_prob = max(
+            0.01, min(0.99, skill - 0.055 * p.bucket + rng.uniform(-0.05, 0.05))
+        )
         solved = rng.random() < solve_prob
 
         if solved:
             passed = 8 + int(rng.random() * 3)  # 8-10
             error = None
         else:
-            passed = int(rng.random() * 6)      # 0-5
+            passed = int(rng.random() * 6)  # 0-5
             error = "simulated failure"
 
         scores.append(
@@ -72,7 +73,9 @@ def simulate_rewards(batch, skill: float, rng: random.Random) -> List[Score]:
     return scores
 
 
-def run_simulation(data_dir: Path, steps: int, sample_size: int, seed: int, scenario: str) -> None:
+def run_simulation(
+    data_dir: Path, steps: int, sample_size: int, seed: int, scenario: str
+) -> None:
     rng = random.Random(seed)
     random.seed(seed)
 
@@ -128,15 +131,21 @@ def run_simulation(data_dir: Path, steps: int, sample_size: int, seed: int, scen
     for step in range(1, steps + 1):
         batch = loader.sample(step)
         if not batch:
-            print(f"{step:>4}  ---  {loader.distribution.mean:>4.2f}   -   --- no samples")
+            print(
+                f"{step:>4}  ---  {loader.distribution.mean:>4.2f}   -   --- no samples"
+            )
             break
 
         if top_reached_step < 0 and loader.distribution.mean >= 7.8 and mode == 9:
             top_reached_step = step
             if scenario == "rise_stop":
-                print(f"{step:>4}  ---  {loader.distribution.mean:>4.2f}   -   --- TOP_REACHED_STOP")
+                print(
+                    f"{step:>4}  ---  {loader.distribution.mean:>4.2f}   -   --- TOP_REACHED_STOP"
+                )
                 break
-            print(f"{step:>4}  ---  {loader.distribution.mean:>4.2f}   -   --- TOP_REACHED_DEGRADE_START")
+            print(
+                f"{step:>4}  ---  {loader.distribution.mean:>4.2f}   -   --- TOP_REACHED_DEGRADE_START"
+            )
 
         skill = skill_from_phase(step, top_reached_step, scenario)
         mean_before = loader.distribution.mean
@@ -150,13 +159,16 @@ def run_simulation(data_dir: Path, steps: int, sample_size: int, seed: int, scen
 
         lo, hi = loader._window()
         window_states = [
-            s for s in loader.problem_states.values()
+            s
+            for s in loader.problem_states.values()
             if lo <= s.bucket <= hi and not s.promoted and s.total_attempts > 0
         ]
         evaluated = len(window_states)
         mastered = sum(
-            1 for s in window_states
-            if s.solve_rate >= loader.solve_threshold and s.consecutive_solves >= loader.consecutive_required
+            1
+            for s in window_states
+            if s.solve_rate >= loader.solve_threshold
+            and s.consecutive_solves >= loader.consecutive_required
         )
         ratio = (mastered / evaluated) if evaluated else 0.0
         if shifted:
@@ -165,7 +177,11 @@ def run_simulation(data_dir: Path, steps: int, sample_size: int, seed: int, scen
             hold_streak += 1
             # Plateau trigger for smoke runs:
             # if we hold too long with saturated reward in the same window, nudge right.
-            if hold_streak >= 8 and avg_reward >= 0.72 and loader.distribution.mean < 8.0:
+            if (
+                hold_streak >= 8
+                and avg_reward >= 0.72
+                and loader.distribution.mean < 8.0
+            ):
                 loader.distribution.shift_right(0.25)
                 shifted = True
                 shift_reason = "plateau"
@@ -219,13 +235,19 @@ def run_simulation(data_dir: Path, steps: int, sample_size: int, seed: int, scen
     print(f"  mean: {stats['mean']:.3f}")
     print(f"  tracked problem states: {stats['n_states']}")
     print(f"  should_stop({steps}): {loader.should_stop(steps)}")
-    print(f"  top_reached_step: {top_reached_step if top_reached_step >= 0 else 'not reached'}")
+    print(
+        f"  top_reached_step: {top_reached_step if top_reached_step >= 0 else 'not reached'}"
+    )
     print("  persisted checkpoint/stats writes: disabled for smoke test")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Tasksets Codeforces all-in-one smoke test")
-    parser.add_argument("--data-dir", type=str, default=str(Path(__file__).parent / "data"))
+    parser = argparse.ArgumentParser(
+        description="Tasksets Codeforces all-in-one smoke test"
+    )
+    parser.add_argument(
+        "--data-dir", type=str, default=str(Path(__file__).parent / "data")
+    )
     parser.add_argument("--steps", type=int, default=30)
     parser.add_argument("--sample-size", type=int, default=24)
     parser.add_argument("--seed", type=int, default=21)
@@ -241,7 +263,9 @@ def main() -> None:
     data_dir = Path(args.data_dir)
     if not data_dir.exists():
         print(f"Missing data dir: {data_dir}")
-        print("Run dataset build first, e.g. python -m taskset.codeforces.make_dataset --max-cf 500 --no-leetcode --out-dir tasksets/codeforces/data")
+        print(
+            "Run dataset build first, e.g. python -m taskset.codeforces.make_dataset --max-cf 500 --no-leetcode --out-dir tasksets/codeforces/data"
+        )
         raise SystemExit(1)
 
     counts = print_data_distribution(data_dir)

@@ -88,7 +88,10 @@ class SDPOAlgo(BaseAlgo):
         self._ema_model: Optional[Any] = None
 
         # Keep EMA full-model path for non-adapter setups.
-        if self.sdpo_config.teacher_reg == "ema" and self.sdpo_config.teacher_adapter is None:
+        if (
+            self.sdpo_config.teacher_reg == "ema"
+            and self.sdpo_config.teacher_adapter is None
+        ):
             try:
                 self._ema_model = copy.deepcopy(model).eval()
                 if hasattr(self._ema_model, "parameters"):
@@ -102,7 +105,10 @@ class SDPOAlgo(BaseAlgo):
 
     @property
     def needs_hidden_states(self) -> bool:
-        return bool(self.sdpo_config.full_logit_distillation or self.sdpo_config.credit_assignment == "logit")
+        return bool(
+            self.sdpo_config.full_logit_distillation
+            or self.sdpo_config.credit_assignment == "logit"
+        )
 
     def bind_old_logprobs(self, old_logprobs: Optional[Tensor]) -> None:
         self._old_logprobs = old_logprobs
@@ -128,7 +134,9 @@ class SDPOAlgo(BaseAlgo):
 
     def _encode(self, text: str, device: torch.device) -> Tensor:
         if self.tokenizer is None:
-            raise RuntimeError("SDPOAlgo requires a tokenizer to build teacher contexts.")
+            raise RuntimeError(
+                "SDPOAlgo requires a tokenizer to build teacher contexts."
+            )
 
         if hasattr(self.tokenizer, "encode"):
             ids = self.tokenizer.encode(text, add_special_tokens=False)
@@ -142,7 +150,9 @@ class SDPOAlgo(BaseAlgo):
             return next(model_obj.parameters()).device
         if hasattr(model_obj, "model") and hasattr(model_obj.model, "parameters"):
             return next(model_obj.model.parameters()).device
-        raise RuntimeError("SDPOAlgo requires model.parameters() or model.model.parameters().")
+        raise RuntimeError(
+            "SDPOAlgo requires model.parameters() or model.model.parameters()."
+        )
 
     def _base_model_obj(self, model_obj: Any) -> Any:
         return model_obj.model if hasattr(model_obj, "model") else model_obj
@@ -225,7 +235,9 @@ class SDPOAlgo(BaseAlgo):
         if completion_ids.ndim == 1:
             completion_ids = completion_ids.unsqueeze(0)
         if completion_ids.ndim != 2:
-            raise ValueError(f"completion_ids must be 1D or 2D, got shape={tuple(completion_ids.shape)}")
+            raise ValueError(
+                f"completion_ids must be 1D or 2D, got shape={tuple(completion_ids.shape)}"
+            )
 
         device = self._model_device(teacher_model)
         completion_ids = completion_ids.to(device, non_blocking=True)
@@ -241,10 +253,17 @@ class SDPOAlgo(BaseAlgo):
 
         with torch.inference_mode():
             hidden_prefix, pos_ids = teacher_model._forward_prefix(full_ids, full_mask)
-            hidden_suffix = teacher_model._forward_suffix(hidden_prefix, pos_ids, full_mask)
-            hidden_comp = hidden_suffix[:, -(completion_len + 1):-1, :]
+            hidden_suffix = teacher_model._forward_suffix(
+                hidden_prefix, pos_ids, full_mask
+            )
+            hidden_comp = hidden_suffix[:, -(completion_len + 1) : -1, :]
 
-            sampled_lp = teacher_model._token_logprobs_chunked(hidden_comp, completion_ids).detach().float().cpu()
+            sampled_lp = (
+                teacher_model._token_logprobs_chunked(hidden_comp, completion_ids)
+                .detach()
+                .float()
+                .cpu()
+            )
 
             if not self.sdpo_config.full_logit_distillation:
                 return sampled_lp, None, None
@@ -256,7 +275,9 @@ class SDPOAlgo(BaseAlgo):
 
             lm_head = teacher_model._lm_head
             seq_len = hidden_comp.shape[1]
-            chunk = max(1, int(getattr(teacher_model, "chunk_size", seq_len) or seq_len))
+            chunk = max(
+                1, int(getattr(teacher_model, "chunk_size", seq_len) or seq_len)
+            )
             topk_logprob_chunks: List[Tensor] = []
             topk_index_chunks: List[Tensor] = []
 
@@ -296,7 +317,9 @@ class SDPOAlgo(BaseAlgo):
         if hidden_comp.ndim == 2:
             hidden_comp = hidden_comp.unsqueeze(0)
         if hidden_comp.ndim != 3:
-            raise ValueError(f"hidden_comp must be shape [T,H] or [B,T,H], got {tuple(hidden_comp.shape)}")
+            raise ValueError(
+                f"hidden_comp must be shape [T,H] or [B,T,H], got {tuple(hidden_comp.shape)}"
+            )
 
         teacher_topk_idx = teacher_topk_idx.to(hidden_comp.device, non_blocking=True)
         lm_head = self.model._lm_head
@@ -337,7 +360,11 @@ class SDPOAlgo(BaseAlgo):
 
         model_device = self._model_device(self.model)
 
-        teacher_model = self._ema_model if self.sdpo_config.teacher_reg == "ema" and self._ema_model is not None else self.model
+        teacher_model = (
+            self._ema_model
+            if self.sdpo_config.teacher_reg == "ema" and self._ema_model is not None
+            else self.model
+        )
         teacher_adapter = self.sdpo_config.teacher_adapter
         student_adapter = self.sdpo_config.student_adapter
         ref_adapter = self.sdpo_config.ref_adapter
@@ -365,7 +392,9 @@ class SDPOAlgo(BaseAlgo):
 
             # Match official self_distillation_mask semantics:
             # distill only when reprompt context contains solution or feedback.
-            has_distill_signal = bool(context_peer_solution) or bool(str(feedback_text).strip())
+            has_distill_signal = bool(context_peer_solution) or bool(
+                str(feedback_text).strip()
+            )
             distill_mask[i] = 1.0 if has_distill_signal else 0.0
 
             teacher_prompt_ids = self.build_teacher_context(
@@ -402,11 +431,17 @@ class SDPOAlgo(BaseAlgo):
                 t_lp = (1.0 - a) * ref_lp + a * t_lp
 
             if t_lp.numel() != t_c:
-                raise RuntimeError(f"Teacher logprob length mismatch: got {t_lp.numel()} expected {t_c}")
+                raise RuntimeError(
+                    f"Teacher logprob length mismatch: got {t_lp.numel()} expected {t_c}"
+                )
 
             teacher_logprobs.append(t_lp)
-            teacher_topk_logprobs.append(t_topk_lp[0] if t_topk_lp is not None else None)
-            teacher_topk_indices.append(t_topk_idx[0] if t_topk_idx is not None else None)
+            teacher_topk_logprobs.append(
+                t_topk_lp[0] if t_topk_lp is not None else None
+            )
+            teacher_topk_indices.append(
+                t_topk_idx[0] if t_topk_idx is not None else None
+            )
 
         # Ensure training path runs student adapter.
         with self._using_adapter(student_adapter):
@@ -414,7 +449,9 @@ class SDPOAlgo(BaseAlgo):
 
         grpo_advantages: Optional[Tensor] = None
         if self.sdpo_config.lambda_grpo > 0.0:
-            grpo_advantages = normalize_advantages(torch.tensor(rewards, dtype=torch.float32))
+            grpo_advantages = normalize_advantages(
+                torch.tensor(rewards, dtype=torch.float32)
+            )
 
         loss_fn = self._make_loss_fn(
             teacher_logprobs=teacher_logprobs,
@@ -427,14 +464,22 @@ class SDPOAlgo(BaseAlgo):
             grpo_advantages=grpo_advantages,
         )
 
-        stacked_teacher = torch.stack(teacher_logprobs) if teacher_logprobs else torch.empty(0)
+        stacked_teacher = (
+            torch.stack(teacher_logprobs) if teacher_logprobs else torch.empty(0)
+        )
         stats = {
-            "mean_reward": float(torch.tensor(rewards).mean().item()) if rewards else 0.0,
-            "mean_teacher_logprob": float(stacked_teacher.mean().item()) if stacked_teacher.numel() else 0.0,
+            "mean_reward": (
+                float(torch.tensor(rewards).mean().item()) if rewards else 0.0
+            ),
+            "mean_teacher_logprob": (
+                float(stacked_teacher.mean().item()) if stacked_teacher.numel() else 0.0
+            ),
             "success_ratio": float(n_success / max(1, g)),
             "used_peer_ratio": float(used_peer / max(1, g)),
             "lambda_grpo": float(self.sdpo_config.lambda_grpo),
-            "distill_mask_fraction": float(distill_mask.mean().item()) if distill_mask.numel() else 0.0,
+            "distill_mask_fraction": (
+                float(distill_mask.mean().item()) if distill_mask.numel() else 0.0
+            ),
         }
         if grpo_advantages is not None:
             stats["mean_grpo_advantage"] = float(grpo_advantages.mean().item())
@@ -468,7 +513,9 @@ class SDPOAlgo(BaseAlgo):
             g_adv = grpo_advantages[idx].to(log_probs.device, non_blocking=True)
             return -(g_adv * log_probs * mask).sum() / mask.sum().clamp(min=1.0)
 
-        def _full_logit_distill(log_probs: Tensor, idx: int, hidden_comp: Optional[Tensor], mask: Tensor) -> Optional[Tensor]:
+        def _full_logit_distill(
+            log_probs: Tensor, idx: int, hidden_comp: Optional[Tensor], mask: Tensor
+        ) -> Optional[Tensor]:
             if not self.sdpo_config.full_logit_distillation:
                 return None
             if hidden_comp is None:
@@ -478,16 +525,24 @@ class SDPOAlgo(BaseAlgo):
             if t_topk_lp is None or t_topk_idx is None:
                 return None
 
-            teacher_distill_log_probs = t_topk_lp.to(log_probs.device, non_blocking=True)
+            teacher_distill_log_probs = t_topk_lp.to(
+                log_probs.device, non_blocking=True
+            )
             teacher_topk_idx_dev = t_topk_idx.to(log_probs.device, non_blocking=True)
-            student_distill_log_probs = self._student_topk_logprobs(hidden_comp, teacher_topk_idx_dev)
+            student_distill_log_probs = self._student_topk_logprobs(
+                hidden_comp, teacher_topk_idx_dev
+            )
 
             if self.sdpo_config.distillation_add_tail:
                 student_distill_log_probs = self._add_tail(student_distill_log_probs)
                 teacher_distill_log_probs = self._add_tail(teacher_distill_log_probs)
             else:
-                student_distill_log_probs = self._renorm_topk_log_probs(student_distill_log_probs)
-                teacher_distill_log_probs = self._renorm_topk_log_probs(teacher_distill_log_probs)
+                student_distill_log_probs = self._renorm_topk_log_probs(
+                    student_distill_log_probs
+                )
+                teacher_distill_log_probs = self._renorm_topk_log_probs(
+                    teacher_distill_log_probs
+                )
 
             alpha = float(self.sdpo_config.alpha)
             if alpha <= 0.0:
@@ -505,7 +560,11 @@ class SDPOAlgo(BaseAlgo):
                     log_target=True,
                 )
             else:
-                alpha_t = torch.tensor(alpha, dtype=student_distill_log_probs.dtype, device=student_distill_log_probs.device)
+                alpha_t = torch.tensor(
+                    alpha,
+                    dtype=student_distill_log_probs.dtype,
+                    device=student_distill_log_probs.device,
+                )
                 mixture_log_probs = torch.logsumexp(
                     torch.stack(
                         [
@@ -515,8 +574,18 @@ class SDPOAlgo(BaseAlgo):
                     ),
                     dim=0,
                 )
-                kl_teacher = F.kl_div(mixture_log_probs, teacher_distill_log_probs, reduction="none", log_target=True)
-                kl_student = F.kl_div(mixture_log_probs, student_distill_log_probs, reduction="none", log_target=True)
+                kl_teacher = F.kl_div(
+                    mixture_log_probs,
+                    teacher_distill_log_probs,
+                    reduction="none",
+                    log_target=True,
+                )
+                kl_student = F.kl_div(
+                    mixture_log_probs,
+                    student_distill_log_probs,
+                    reduction="none",
+                    log_target=True,
+                )
                 kl_loss = torch.lerp(kl_student, kl_teacher, alpha_t)
 
             per_token_loss = kl_loss.sum(-1)
@@ -525,25 +594,37 @@ class SDPOAlgo(BaseAlgo):
             is_clip = self.sdpo_config.is_clip
             if is_clip is not None and self._old_logprobs is not None:
                 old_lp = self._old_logprobs[idx].to(log_probs.device, non_blocking=True)
-                ratio = torch.exp(torch.clamp((log_probs - old_lp).detach(), min=-20.0, max=20.0)).clamp(max=float(is_clip))
+                ratio = torch.exp(
+                    torch.clamp((log_probs - old_lp).detach(), min=-20.0, max=20.0)
+                ).clamp(max=float(is_clip))
                 per_token_loss = per_token_loss * ratio
 
             return masked_mean(per_token_loss, mask)
 
-        def loss_fn(log_probs: Tensor, gen_idx: int, hidden_comp: Optional[Tensor] = None) -> Tensor:
+        def loss_fn(
+            log_probs: Tensor, gen_idx: int, hidden_comp: Optional[Tensor] = None
+        ) -> Tensor:
             mask = completion_mask[gen_idx].to(log_probs.device, non_blocking=True)
-            sample_distill_mask = distill_mask[gen_idx].to(log_probs.device, non_blocking=True)
+            sample_distill_mask = distill_mask[gen_idx].to(
+                log_probs.device, non_blocking=True
+            )
             mask = mask * sample_distill_mask
 
             full_logit_loss = _full_logit_distill(log_probs, gen_idx, hidden_comp, mask)
             if full_logit_loss is not None:
                 sdpo_loss = full_logit_loss
             else:
-                teacher_lp = teacher_logprobs[gen_idx].to(log_probs.device, non_blocking=True)
-                token_adv = (teacher_lp - log_probs.detach()).clamp(min=-max_adv, max=max_adv) * mask
+                teacher_lp = teacher_logprobs[gen_idx].to(
+                    log_probs.device, non_blocking=True
+                )
+                token_adv = (teacher_lp - log_probs.detach()).clamp(
+                    min=-max_adv, max=max_adv
+                ) * mask
                 if credit_assignment == "sequence":
                     seq_adv = masked_mean(token_adv, mask)
-                    sdpo_loss = -(seq_adv * log_probs * mask).sum() / mask.sum().clamp(min=1.0)
+                    sdpo_loss = -(seq_adv * log_probs * mask).sum() / mask.sum().clamp(
+                        min=1.0
+                    )
                 else:
                     sdpo_loss = -masked_mean(token_adv * log_probs, mask)
 
@@ -558,9 +639,15 @@ class SDPOAlgo(BaseAlgo):
 
     def update_ema_teacher(self, alpha: float = 0.01) -> None:
         a = float(alpha)
-        if self._ema_model is not None and hasattr(self._ema_model, "parameters") and hasattr(self.model, "parameters"):
+        if (
+            self._ema_model is not None
+            and hasattr(self._ema_model, "parameters")
+            and hasattr(self.model, "parameters")
+        ):
             with torch.inference_mode():
-                for p_ema, p_cur in zip(self._ema_model.parameters(), self.model.parameters()):
+                for p_ema, p_cur in zip(
+                    self._ema_model.parameters(), self.model.parameters()
+                ):
                     p_ema.mul_(1.0 - a).add_(p_cur.detach(), alpha=a)
             return
 

@@ -28,7 +28,9 @@ class AgenticDPOConfig:
     # --- model ---
     model_path: str
     model_type: str = "qwen3"
-    lora_targets: list[str] = field(default_factory=lambda: ["gate_proj", "up_proj", "down_proj"])
+    lora_targets: list[str] = field(
+        default_factory=lambda: ["gate_proj", "up_proj", "down_proj"]
+    )
     lora_fraction: float = 0.5
     lora_rank: int = 64
     lora_alpha: int = 128
@@ -98,7 +100,9 @@ class AgenticDPOPipeline:
                     data = json.load(f)
                 if isinstance(data, dict):
                     self._task_stats = data
-                    tqdm.write(f"[resume] loaded task_stats with {len(self._task_stats)} entries")
+                    tqdm.write(
+                        f"[resume] loaded task_stats with {len(self._task_stats)} entries"
+                    )
             except Exception:
                 pass
 
@@ -121,7 +125,9 @@ class AgenticDPOPipeline:
         ModelCls = getattr(importlib.import_module(profile.module), profile.cls_name)
         train_model = self._build_train_model(ModelCls, model_cfg)
 
-        trainable_params = [p for p in train_model.model.parameters() if p.requires_grad]
+        trainable_params = [
+            p for p in train_model.model.parameters() if p.requires_grad
+        ]
         optimizer = torch.optim.AdamW(trainable_params, lr=cfg.dpo_lr)
 
         distribution = BucketDistribution(
@@ -164,7 +170,9 @@ class AgenticDPOPipeline:
         if profile.reasoning_parser is not None:
             engine_kwargs["reasoning_parser"] = profile.reasoning_parser
 
-        engine: BaseEngine = VLLMEngine(model_path=cfg.model_path, engine_kwargs=engine_kwargs)
+        engine: BaseEngine = VLLMEngine(
+            model_path=cfg.model_path, engine_kwargs=engine_kwargs
+        )
         await self._engine_init(engine)
 
         verifier = self._build_verifier()
@@ -236,25 +244,37 @@ class AgenticDPOPipeline:
 
     def _build_train_model(self, ModelCls, model_cfg):
         cfg = self.cfg
-        adapter_path = cfg.student_adapter_path or None
-        try:
+        adapter_path = None
+        if cfg.student_adapter_path:
+            candidate = Path(cfg.student_adapter_path).expanduser().resolve()
+            if candidate.exists():
+                adapter_path = str(candidate)
+            else:
+                tqdm.write(
+                    f"[init] student adapter path not found, starting fresh: {candidate}"
+                )
+
+        if adapter_path and ModelCls.__name__ == "Gemma4Model":
             train_model = ModelCls(
                 cfg.model_path,
                 model_cfg,
                 lora_path=adapter_path,
+                lora_adapter_name=cfg.student_adapter_name,
+                lora_is_trainable=True,
             )
-        except TypeError:
-            train_model = ModelCls(cfg.model_path, model_cfg)
-            if adapter_path:
-                train_model.load_lora_adapter(
-                    cfg.student_adapter_name,
-                    str(Path(adapter_path).expanduser().resolve()),
-                    is_trainable=True,
-                )
-                try:
-                    train_model.set_active_lora_adapter(cfg.student_adapter_name)
-                except Exception:
-                    pass
+            return train_model
+
+        train_model = ModelCls(cfg.model_path, model_cfg)
+        if adapter_path:
+            train_model.load_lora_adapter(
+                cfg.student_adapter_name,
+                adapter_path,
+                is_trainable=True,
+            )
+            try:
+                train_model.set_active_lora_adapter(cfg.student_adapter_name)
+            except Exception:
+                pass
         return train_model
 
     def _build_verifier(self):
@@ -312,7 +332,9 @@ class AgenticDPOPipeline:
             if torch.cuda.is_available() and rng.get("cuda") is not None:
                 torch.cuda.set_rng_state_all(rng["cuda"])
 
-        tqdm.write(f"[resume] training checkpoint - resuming from step {step} (last completed: {step - 1})")
+        tqdm.write(
+            f"[resume] training checkpoint - resuming from step {step} (last completed: {step - 1})"
+        )
         return step
 
     async def run_batch(
@@ -379,7 +401,9 @@ class AgenticDPOPipeline:
             passed = bool(sc.total > 0 and sc.passed == sc.total and clean)
             return sc, reward, passed
 
-        gen_tasks: list[tuple[Problem, list[dict], asyncio.Future | asyncio.Task | object]] = []
+        gen_tasks: list[
+            tuple[Problem, list[dict], asyncio.Future | asyncio.Task | object]
+        ] = []
         for problem in batch:
             messages = []
             if cfg.system_prompt:
@@ -414,7 +438,9 @@ class AgenticDPOPipeline:
                 best_scores.append(best_row["score"])
                 self._update_task_stats(problem, problem_rows)
             else:
-                best_scores.append(Score(compiled=False, passed=0, total=0, error="no generation"))
+                best_scores.append(
+                    Score(compiled=False, passed=0, total=0, error="no generation")
+                )
 
         batch_stats = self._build_batch_stats(batch=batch, rows=rows)
         return rows, best_scores, batch_stats
@@ -496,7 +522,11 @@ class AgenticDPOPipeline:
                 {
                     "python": random.getstate(),
                     "torch": torch.random.get_rng_state(),
-                    "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                    "cuda": (
+                        torch.cuda.get_rng_state_all()
+                        if torch.cuda.is_available()
+                        else None
+                    ),
                 },
                 tmp_dir / "rng.pt",
             )
@@ -527,7 +557,9 @@ class AgenticDPOPipeline:
                 )
                 self._lora_in_vllm = True
                 self._active_engine_adapter = cfg.student_adapter_name
-                tqdm.write(f"[init] vLLM loaded {cfg.student_adapter_name} from {student_path.name}")
+                tqdm.write(
+                    f"[init] vLLM loaded {cfg.student_adapter_name} from {student_path.name}"
+                )
             else:
                 tqdm.write(f"[init] student adapter path not found: {student_path}")
         else:
@@ -609,7 +641,9 @@ class AgenticDPOPipeline:
             selected.append(max(problem_rows, key=lambda r: float(r["reward"])))
         return selected
 
-    def _build_batch_stats(self, *, batch: list[Problem], rows: list[dict]) -> dict[str, float]:
+    def _build_batch_stats(
+        self, *, batch: list[Problem], rows: list[dict]
+    ) -> dict[str, float]:
         selected = self._select_best_rows(rows)
         out: dict[str, float] = {
             "n_problems": float(len(batch)),
@@ -628,10 +662,14 @@ class AgenticDPOPipeline:
         pid = str(problem.id)
         last_passed = sum(1 for r in rows if r["passed"])
         last_total = len(rows)
-        stats = self._task_stats.setdefault(pid, {"total_attempts": 0, "total_passed": 0})
+        stats = self._task_stats.setdefault(
+            pid, {"total_attempts": 0, "total_passed": 0}
+        )
         stats["total_attempts"] += last_total
         stats["total_passed"] += last_passed
-        stats["overall_pass_rate"] = round(stats["total_passed"] / max(1, stats["total_attempts"]), 3)
+        stats["overall_pass_rate"] = round(
+            stats["total_passed"] / max(1, stats["total_attempts"]), 3
+        )
         stats["last_pass_rate"] = round(last_passed / max(1, last_total), 3)
 
     def _write_task_stats(self) -> None:

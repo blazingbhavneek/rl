@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import json
 import random
 from pathlib import Path
@@ -20,7 +21,14 @@ def extract_function_name(fn: dict) -> str:
     Best-effort extraction of function name from raw dict.
     Tries common key names, then falls back to parsing the signature.
     """
-    for key in ("function_name", "name", "func_name", "fn_name", "functionName", "funcName"):
+    for key in (
+        "function_name",
+        "name",
+        "func_name",
+        "fn_name",
+        "functionName",
+        "funcName",
+    ):
         if key in fn and fn[key]:
             return str(fn[key]).strip()
 
@@ -30,12 +38,36 @@ def extract_function_name(fn: dict) -> str:
         # "int fn_open_session(handle_t *h, ...)" → "fn_open_session"
         tokens = sig.replace("(", " ").split()
         skip = {
-            "int", "void", "char", "unsigned", "signed", "long", "short",
-            "float", "double", "const", "static", "extern", "inline",
-            "struct", "enum", "union", "typedef",
-            "uint8_t", "uint16_t", "uint32_t", "uint64_t",
-            "int8_t", "int16_t", "int32_t", "int64_t",
-            "size_t", "ssize_t", "ptrdiff_t", "bool", "FILE",
+            "int",
+            "void",
+            "char",
+            "unsigned",
+            "signed",
+            "long",
+            "short",
+            "float",
+            "double",
+            "const",
+            "static",
+            "extern",
+            "inline",
+            "struct",
+            "enum",
+            "union",
+            "typedef",
+            "uint8_t",
+            "uint16_t",
+            "uint32_t",
+            "uint64_t",
+            "int8_t",
+            "int16_t",
+            "int32_t",
+            "int64_t",
+            "size_t",
+            "ssize_t",
+            "ptrdiff_t",
+            "bool",
+            "FILE",
         }
         for t in tokens:
             t_clean = t.lstrip("*").strip()
@@ -58,6 +90,7 @@ def extract_params(fn: dict) -> list[dict]:
 
 
 # ─── Prompt builders ─────────────────────────────────────────────────────
+
 
 def build_b0_input(fn: dict) -> tuple[str, str]:
     """
@@ -114,11 +147,12 @@ def build_b2_input(fn: dict) -> tuple[str, str]:
 
     type_keys = {"type", "param_type", "ctype", "c_type", "data_type", "dtype", "kind"}
     stripped = [
-        {k: v for k, v in p.items() if k.lower() not in type_keys}
-        for p in shuffled
+        {k: v for k, v in p.items() if k.lower() not in type_keys} for p in shuffled
     ]
 
-    params_block = json.dumps(stripped, indent=2, ensure_ascii=False) if stripped else "[]"
+    params_block = (
+        json.dumps(stripped, indent=2, ensure_ascii=False) if stripped else "[]"
+    )
 
     model_input = (
         f"Function: {fn_name}\n\n"

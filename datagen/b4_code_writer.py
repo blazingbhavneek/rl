@@ -7,19 +7,21 @@ For each task variant:
   - Uses verify_code to compile and self-correct
   - Produces TWO SFT pairs: (detailed_prompt, code) and (vague_prompt, code)
 """
+
 from __future__ import annotations
-import asyncio
+
 import argparse
+import asyncio
 import importlib
 import json
 import os
 from pathlib import Path
 
 from agents.master_agent import MasterAgent
-from agents.verify import verify_code, compile_code
 from agents.prompts import CODE_WRITER_PROMPT
-from agents.schemas import SFTPair, MultiTaskOutput, TaskDesignerOutput
+from agents.schemas import MultiTaskOutput, SFTPair, TaskDesignerOutput
 from agents.utils import extract_code
+from agents.verify import compile_code, verify_code
 
 
 def load_task_file(path: str) -> MultiTaskOutput:
@@ -37,7 +39,7 @@ async def process_task(
 ) -> list[SFTPair]:
     spec = task.spec
     detailed_prompt = task.detailed_prompt
-    vague_prompt    = task.vague_prompt
+    vague_prompt = task.vague_prompt
 
     agent = MasterAgent(
         system_prompt=CODE_WRITER_PROMPT,
@@ -58,9 +60,9 @@ async def process_task(
 
     # Build writer prompt from spec — code writer sees the full structured spec
     steps_block = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(spec.detailed_steps))
-    pre_block   = "\n".join(f"  - {p}" for p in spec.preconditions)   or "  (none)"
-    clean_block = "\n".join(f"  - {c}" for c in spec.cleanup_steps)   or "  (none)"
-    req_block   = ", ".join(spec.required_functions)                   or "(see steps)"
+    pre_block = "\n".join(f"  - {p}" for p in spec.preconditions) or "  (none)"
+    clean_block = "\n".join(f"  - {c}" for c in spec.cleanup_steps) or "  (none)"
+    req_block = ", ".join(spec.required_functions) or "(see steps)"
 
     writer_prompt = f"""\
 TASK: {spec.task_description}
@@ -126,20 +128,32 @@ INSTRUCTIONS:
         vague_prompt=vague_prompt,
     )
 
-    (Path(output_dir) / f"{tag}_detailed.json").write_text(detailed_pair.model_dump_json(indent=2))
-    (Path(output_dir) / f"{tag}_vague.json").write_text(vague_pair.model_dump_json(indent=2))
+    (Path(output_dir) / f"{tag}_detailed.json").write_text(
+        detailed_pair.model_dump_json(indent=2)
+    )
+    (Path(output_dir) / f"{tag}_vague.json").write_text(
+        vague_pair.model_dump_json(indent=2)
+    )
 
     return [detailed_pair, vague_pair]
 
 
 async def main():
     parser = argparse.ArgumentParser(description="b4: Code Writer")
-    parser.add_argument("--tasks-dir",        required=True, help="Folder with b4_tasks_*.json from designer")
-    parser.add_argument("--output-dir",       required=True, help="Folder for SFT pair outputs")
-    parser.add_argument("--config",           required=True)
+    parser.add_argument(
+        "--tasks-dir", required=True, help="Folder with b4_tasks_*.json from designer"
+    )
+    parser.add_argument(
+        "--output-dir", required=True, help="Folder for SFT pair outputs"
+    )
+    parser.add_argument("--config", required=True)
     parser.add_argument("--mcp-tools-module", required=True)
-    parser.add_argument("--concurrency",      type=int, default=3,
-                        help="b4 code writers are heavy — keep low")
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=3,
+        help="b4 code writers are heavy — keep low",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -151,8 +165,7 @@ async def main():
     specialist_tools = tools_mod.tools
 
     task_files = sorted(
-        p for p in Path(args.tasks_dir).glob("b4_tasks_*.json")
-        if "_RAW" not in p.name
+        p for p in Path(args.tasks_dir).glob("b4_tasks_*.json") if "_RAW" not in p.name
     )
     print(f"[b4-code] Found {len(task_files)} task design files")
 
@@ -166,8 +179,10 @@ async def main():
         except Exception as e:
             print(f"[b4-code] SKIP {tf.name}: {e}")
 
-    print(f"[b4-code] {len(jobs)} total tasks to write code for "
-          f"({len(jobs) * 2} SFT pairs expected)")
+    print(
+        f"[b4-code] {len(jobs)} total tasks to write code for "
+        f"({len(jobs) * 2} SFT pairs expected)"
+    )
 
     semaphore = asyncio.Semaphore(args.concurrency)
 
@@ -184,8 +199,8 @@ async def main():
     results = await asyncio.gather(*[bounded(fn, i, t) for fn, i, t in jobs])
 
     all_pairs = [p for batch in results for p in batch]
-    compiled  = sum(1 for p in all_pairs if p.compiled)
-    total     = len(all_pairs)
+    compiled = sum(1 for p in all_pairs if p.compiled)
+    total = len(all_pairs)
     print(f"\n{'='*50}")
     print(f"b4-code SUMMARY: {compiled}/{total} pairs compiled")
     print(f"{'='*50}")

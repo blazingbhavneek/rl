@@ -36,10 +36,10 @@ MODEL_PATH = "Qwen/Qwen3-8B"
 
 # which linear projections to attach LoRA to (suffix layers only, per lora_fraction)
 LORA_TARGETS = ["gate_proj", "up_proj", "down_proj"]
-LORA_FRACTION = 0.5     # fraction of layers from the top that are trainable
+LORA_FRACTION = 0.5  # fraction of layers from the top that are trainable
 LORA_RANK = 64
-LORA_ALPHA = 128        # typically 2× rank
-CHUNK_SIZE = 10        # token chunk size for chunked logprob computation (memory vs speed)
+LORA_ALPHA = 128  # typically 2× rank
+CHUNK_SIZE = 10  # token chunk size for chunked logprob computation (memory vs speed)
 CUDA_DEVICE = 0
 GRAD_CHECKPOINT = True  # activation checkpointing in suffix layers
 
@@ -48,20 +48,20 @@ ENGINE_BASE_URL = "http://127.0.0.1:8000/v1"
 ENGINE_API_KEY = "EMPTY"
 # fraction of GPU VRAM reserved for vLLM; remainder goes to train_model
 ENGINE_GPU_MEM = 0.50
-ENGINE_SEMAPHORE = 32   # max concurrent generation requests
+ENGINE_SEMAPHORE = 32  # max concurrent generation requests
 
 # ── rollouts ──────────────────────────────────────────────────────────────────
-N_ROLLOUTS = 8          # completions sampled per problem per step
+N_ROLLOUTS = 8  # completions sampled per problem per step
 TEMPERATURE = 0.7
 
 # system prompt shown to the student model during generation
 SYSTEM_PROMPT = "Solve the problem in C. Return only one ```c``` code block."
 
 # ── teacher correction ────────────────────────────────────────────────────────
-TEACHER_TEMPERATURE = 0.2   # lower = more deterministic hints
-MAX_HINT_ATTEMPTS = 2       # retries per failed rollout
+TEACHER_TEMPERATURE = 0.2  # lower = more deterministic hints
+MAX_HINT_ATTEMPTS = 2  # retries per failed rollout
 HINT_REWARD_DISCOUNT = 0.7  # scale reward of teacher-assisted solutions (< 1 to distinguish from clean wins)
-TEACHER_MAX_TURNS = 6       # max tool-call rounds; with tools=[] exits on 1st turn
+TEACHER_MAX_TURNS = 6  # max tool-call rounds; with tools=[] exits on 1st turn
 
 # ── teacher: RAG agent (optional — uncomment to enable) ──────────────────────
 # TEACHER_DOCS_FOLDER     = "/path/to/your/docs.md"
@@ -73,41 +73,43 @@ TEACHER_MAX_TURNS = 6       # max tool-call rounds; with tools=[] exits on 1st t
 
 # ── LoRA adapters (set paths to enable; None = no adapter) ───────────────────
 STUDENT_ADAPTER_NAME = "student"
-STUDENT_ADAPTER_PATH = "checkpoints/student_lora"  # path to saved student adapter, or None for base model
-REF_ADAPTER_NAME = None      # reference adapter for KL penalty; None = disable KL
+STUDENT_ADAPTER_PATH = (
+    "checkpoints/student_lora"  # path to saved student adapter, or None for base model
+)
+REF_ADAPTER_NAME = None  # reference adapter for KL penalty; None = disable KL
 REF_ADAPTER_PATH = None
 
 # ── GRPO algorithm ────────────────────────────────────────────────────────────
-KL_COEFF = 0.0          # KL penalty coefficient (0 = off; set > 0 if using ref adapter)
-CLIP_RATIO_LOW = 0.2    # PPO clip lower bound (1 - clip_low)
+KL_COEFF = 0.0  # KL penalty coefficient (0 = off; set > 0 if using ref adapter)
+CLIP_RATIO_LOW = 0.2  # PPO clip lower bound (1 - clip_low)
 CLIP_RATIO_HIGH = 0.28  # PPO clip upper bound (1 + clip_high); asymmetric = tighter on positive advantage
 NORM_ADVANTAGES = True  # group-normalize advantages before policy update
 
 # ── optimizer ─────────────────────────────────────────────────────────────────
 LR = 2e-5
-GRAD_CLIP = 1.0         # max gradient norm before clipping
+GRAD_CLIP = 1.0  # max gradient norm before clipping
 
 # ── curriculum ────────────────────────────────────────────────────────────────
 DATASET_DIR = "taskset/codeforces/data"
-TRAIN_STEPS = 10        # total optimizer steps
-SAMPLE_SIZE = 2        # problems sampled per step
-N_BUCKETS = 9           # difficulty buckets (e.g. Codeforces A–G mapped to 1–9)
-INITIAL_MEAN = 0.6      # starting bucket mean (0=easiest, 1=hardest)
-CURRICULUM_STD = 1.0    # spread of the Gaussian sampling distribution over buckets
+TRAIN_STEPS = 10  # total optimizer steps
+SAMPLE_SIZE = 2  # problems sampled per step
+N_BUCKETS = 9  # difficulty buckets (e.g. Codeforces A–G mapped to 1–9)
+INITIAL_MEAN = 0.6  # starting bucket mean (0=easiest, 1=hardest)
+CURRICULUM_STD = 1.0  # spread of the Gaussian sampling distribution over buckets
 
 # a problem "graduates" when its solve rate exceeds this for CONSECUTIVE_REQUIRED steps
 SOLVE_THRESHOLD = 0.8
 CONSECUTIVE_REQUIRED = 2
 
-MIN_EVALUATED = 8       # minimum rollouts before a curriculum shift is considered
-SHIFT_DELTA = 1.0       # how much the mean shifts right when graduation triggers
-SHIFT_WINDOW_RADIUS = 0 # smooth shift over ± this many buckets (0 = hard shift)
-ROLLING_WINDOW = 20     # steps of history used to compute rolling solve rate
+MIN_EVALUATED = 8  # minimum rollouts before a curriculum shift is considered
+SHIFT_DELTA = 1.0  # how much the mean shifts right when graduation triggers
+SHIFT_WINDOW_RADIUS = 0  # smooth shift over ± this many buckets (0 = hard shift)
+ROLLING_WINDOW = 20  # steps of history used to compute rolling solve rate
 REQUIRE_FULL_BUCKET_COVERAGE = True  # don't shift until every bucket has been sampled
 
 # ── verifier ──────────────────────────────────────────────────────────────────
 VERIFIER_TIMEOUT = 5.0  # seconds per test case execution
-VERIFIER_WORKERS = 16   # parallel worker processes
+VERIFIER_WORKERS = 16  # parallel worker processes
 
 
 async def main() -> None:

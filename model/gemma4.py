@@ -1,665 +1,57 @@
 import inspect
 import math
+import shutil
+import tempfile
 from collections import deque
-from dataclasses import dataclass
-from typing import Callable
+from pathlib import Path
 
 import torch
-import torch.nn as nn
 import torch._functorch.config as _functorch_config
-
-# Donated buffers are incompatible with retain_graph=True used in
-# _StreamCheckpointFunction.backward. Disable globally before any compilation.
-_functorch_config.donated_buffer = False
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftConfig, PeftModel, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+from transformers.masking_utils import create_causal_mask
 
 from .base import BaseModel
-
-
-@dataclass
-class _PrefixBundle:
-    hidden_prefix: torch.Tensor
-    position_ids: torch.Tensor
-    shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]]
-    per_layer_inputs: torch.Tensor | None
-    mask_mapping: dict | None = None
-    position_embeddings: dict | None = None
-
-
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def _apply_rotary_pos_emb(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    unsqueeze_dim: int = 1,
-) -> torch.Tensor:
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    return (x * cos) + (_rotate_half(x) * sin)
-
-
-def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-
-def _slice_shared_kv_states(
-    shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]],
-    seq_end: int | None,
-) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
-    if seq_end is None:
-        return shared_kv_states
-    return {
-        key: (
-            key_states[:, :, :seq_end, :],
-            value_states[:, :, :seq_end, :],
-        )
-        for key, (key_states, value_states) in shared_kv_states.items()
-    }
-
-
-def _normalize_chunk_size(chunk_size: int | None) -> int:
-    chunk = int(chunk_size or 0)
-    return chunk if chunk > 0 else 0
-
-
-def _get_chunk_kv_range(
-    *,
-    start: int,
-    end: int,
-    sliding_window: int | None,
-) -> tuple[int, int]:
-    if sliding_window is None:
-        return 0, end
-    return max(0, start - sliding_window + 1), end
-
-
-class _StreamCheckpointFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        run_function: Callable,
-        chunk_size: int,
-        offload_to_cpu: bool,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        ctx.run_function = run_function
-        ctx.chunk_size = max(1, int(chunk_size))
-        saved_hidden = hidden_states.detach()
-        if offload_to_cpu and saved_hidden.device.type != "cpu":
-            saved_hidden = saved_hidden.to("cpu", non_blocking=True)
-        ctx.save_for_backward(saved_hidden)
-
-        seq_len = hidden_states.shape[1]
-        with torch.no_grad():
-            if hasattr(ctx.run_function, "prepare_for_replay"):
-                ctx.run_function.prepare_for_replay(hidden_states, requires_grad=False)
-            outputs = torch.empty_like(hidden_states)
-            for start in range(0, seq_len, ctx.chunk_size):
-                end = min(start + ctx.chunk_size, seq_len)
-                outputs[:, start:end, :] = run_function(hidden_states, chunk_range=(start, end))
-            if hasattr(ctx.run_function, "clear_replay_cache"):
-                ctx.run_function.clear_replay_cache()
-        return outputs
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        (hidden_states_saved,) = ctx.saved_tensors
-        hidden_states_detached = hidden_states_saved.to(
-            device=grad_output.device,
-            non_blocking=True,
-        ).detach().requires_grad_(True)
-        seq_len = grad_output.shape[1]
-        shared_graph = False
-        if hasattr(ctx.run_function, "prepare_for_replay"):
-            with torch.enable_grad():
-                ctx.run_function.prepare_for_replay(hidden_states_detached, requires_grad=True)
-            shared_graph = True
-
-        try:
-            for start in range(0, seq_len, ctx.chunk_size):
-                end = min(start + ctx.chunk_size, seq_len)
-                with torch.enable_grad():
-                    output_chunk = ctx.run_function(
-                        hidden_states_detached,
-                        chunk_range=(start, end),
-                    )
-                    torch.autograd.backward(
-                        output_chunk,
-                        grad_tensors=grad_output[:, start:end, :].detach(),
-                        retain_graph=shared_graph and end < seq_len,
-                    )
-        finally:
-            if hasattr(ctx.run_function, "clear_replay_cache"):
-                ctx.run_function.clear_replay_cache()
-
-        return None, None, None, hidden_states_detached.grad
-
-
-_COMPILE_MODE = "default"
-
-
-def _stream_attention_forward(
-    module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    key_states = _repeat_kv(key, module.num_key_value_groups)
-    value_states = _repeat_kv(value, module.num_key_value_groups)
-
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * module.scaling
-    softcap = getattr(module.config, "attn_logit_softcapping", None)
-    if softcap is not None:
-        attn_weights = torch.tanh(attn_weights / softcap) * softcap
-    if attention_mask is not None:
-        attn_weights = attn_weights + attention_mask
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    if module.training and module.attention_dropout:
-        attn_weights = nn.functional.dropout(attn_weights, p=module.attention_dropout, training=True)
-    attn_output = torch.matmul(attn_weights, value_states)
-    return attn_output.transpose(1, 2), attn_weights
-
-
-class _LayerReplay:
-    def __init__(
-        self,
-        layer,
-        abs_idx: int,
-        current_per_layer_input_source: torch.Tensor | None,
-        self_outer,
-        mask_mapping: dict,
-        position_embeddings: dict,
-        position_ids: torch.Tensor,
-        shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]],
-    ):
-        self.layer = layer
-        self.abs_idx = abs_idx
-        self.current_per_layer_input_source = current_per_layer_input_source
-        self.self_outer = self_outer
-        self.mask_mapping = mask_mapping
-        self.position_embeddings = position_embeddings
-        self.position_ids = position_ids
-        self.shared_kv_states = shared_kv_states
-        self.shared_kv_local: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
-        self._materialized_shared_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
-
-    def _get_materialized_shared_kv(
-        self,
-        device: torch.device,
-    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
-        if self._materialized_shared_kv is None:
-            self._materialized_shared_kv = self.self_outer._materialize_shared_kv_states(
-                self.shared_kv_states,
-                device,
-                None,
-            )
-        return self._materialized_shared_kv
-
-    def prepare_for_replay(self, h: torch.Tensor, requires_grad: bool) -> None:
-        self.shared_kv_local = self._get_materialized_shared_kv(h.device)
-        if isinstance(self.layer, _StreamGemmaDecoderLayer):
-            self.layer.prepare_for_replay(
-                h,
-                self.position_embeddings[self.self_outer._layer_types[self.abs_idx]],
-                self.shared_kv_local,
-            )
-
-    def clear_replay_cache(self) -> None:
-        if isinstance(self.layer, _StreamGemmaDecoderLayer):
-            self.layer.clear_replay_cache()
-        self.shared_kv_local = None
-        self._materialized_shared_kv = None
-
-    def __call__(
-        self,
-        h: torch.Tensor,
-        chunk_range: tuple[int, int] | None = None,
-    ) -> torch.Tensor:
-        seq_end = None if chunk_range is None else chunk_range[1]
-        per_layer_input_local = None
-        if self.current_per_layer_input_source is not None:
-            if chunk_range is None:
-                per_layer_input_local = self.self_outer._move_tensor(self.current_per_layer_input_source, h.device)
-            else:
-                per_layer_input_local = self.self_outer._move_tensor(
-                    self.current_per_layer_input_source[:, chunk_range[0]:chunk_range[1], :],
-                    h.device,
-                )
-
-        full_shared_kv = self.shared_kv_local
-        if full_shared_kv is None:
-            full_shared_kv = self._get_materialized_shared_kv(h.device)
-        if seq_end is None or seq_end == h.shape[1]:
-            shared_kv_local = full_shared_kv
-        else:
-            shared_kv_local = _slice_shared_kv_states(full_shared_kv, seq_end)
-
-        output = _run_layer(
-            self.layer,
-            h,
-            self.mask_mapping,
-            self.position_embeddings,
-            self.position_ids,
-            shared_kv_local,
-            self.self_outer._layer_types[self.abs_idx],
-            per_layer_input=per_layer_input_local,
-            chunk_range=chunk_range,
-        )
-        if seq_end is None or seq_end == h.shape[1]:
-            for key, value in full_shared_kv.items():
-                self.shared_kv_states[key] = value
-        return output
-
-
-class _StreamGemmaAttention(nn.Module):
-    def __init__(self, base_attn: nn.Module):
-        super().__init__()
-        self.base_attn = base_attn
-        self._replay_key_states: torch.Tensor | None = None
-        self._replay_value_states: torch.Tensor | None = None
-
-    def __getattr__(self, name: str):
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            return getattr(self.base_attn, name)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: torch.Tensor,
-        attention_mask: torch.Tensor | None,
-        shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]],
-        past_key_values=None,
-        chunk_range: tuple[int, int] | None = None,
-        **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        full_hidden_seq_len = kwargs.pop("full_hidden_seq_len", hidden_states.shape[1])
-        if chunk_range is None:
-            return self.base_attn(
-                hidden_states=hidden_states,
-                position_embeddings=position_embeddings,
-                attention_mask=attention_mask,
-                shared_kv_states=shared_kv_states,
-                past_key_values=past_key_values,
-                **kwargs,
-            )
-
-        batch_size = hidden_states.shape[0]
-        start, end = chunk_range
-        chunk_len = end - start
-        cos, sin = position_embeddings
-        sliding_window = None
-        if getattr(self, "layer_type", None) == "sliding_attention":
-            sliding_window = getattr(self.config, "sliding_window", None)
-        kv_start, kv_end = _get_chunk_kv_range(
-            start=start,
-            end=end,
-            sliding_window=sliding_window,
-        )
-        need_full_store = self.store_full_length_kv and not self.is_kv_shared_layer and end == full_hidden_seq_len
-
-        query_input = hidden_states if hidden_states.shape[1] == chunk_len else hidden_states[:, start:end, :]
-        query_states = self.q_proj(query_input).view(batch_size, chunk_len, -1, self.head_dim)
-        query_states = self.q_norm(query_states)
-        query_states = _apply_rotary_pos_emb(
-            query_states,
-            cos[:, start:end, :],
-            sin[:, start:end, :],
-            unsqueeze_dim=2,
-        ).transpose(1, 2)
-
-        full_key_states = None
-        full_value_states = None
-        if self._replay_key_states is not None and self._replay_value_states is not None:
-            key_states = self._replay_key_states[:, :, kv_start:kv_end, :]
-            value_states = self._replay_value_states[:, :, kv_start:kv_end, :]
-            if need_full_store:
-                full_key_states = self._replay_key_states[:, :, :end, :]
-                full_value_states = self._replay_value_states[:, :, :end, :]
-        elif self.is_kv_shared_layer:
-            key_states, value_states = shared_kv_states[self.kv_shared_layer_index]
-            key_states = key_states[:, :, kv_start:kv_end, :]
-            value_states = value_states[:, :, kv_start:kv_end, :]
-            key_states = key_states.to(query_states.device, non_blocking=True)
-            value_states = value_states.to(query_states.device, non_blocking=True)
-        else:
-            kv_hidden = hidden_states[:, kv_start:kv_end, :]
-            kv_len = kv_end - kv_start
-            key_states = self.k_proj(kv_hidden).view(batch_size, kv_len, -1, self.head_dim)
-            value_states = (
-                self.v_proj(kv_hidden).view(batch_size, kv_len, -1, self.head_dim)
-                if self.v_proj is not None
-                else key_states
-            )
-            key_states = self.k_norm(key_states)
-            key_states = _apply_rotary_pos_emb(
-                key_states,
-                cos[:, kv_start:kv_end, :],
-                sin[:, kv_start:kv_end, :],
-                unsqueeze_dim=2,
-            ).transpose(1, 2)
-            value_states = self.v_norm(value_states).transpose(1, 2)
-            if need_full_store:
-                if kv_start == 0:
-                    full_key_states = key_states
-                    full_value_states = value_states
-                else:
-                    full_kv_hidden = hidden_states[:, :end, :]
-                    full_key_states = self.k_proj(full_kv_hidden).view(batch_size, end, -1, self.head_dim)
-                    full_value_states = (
-                        self.v_proj(full_kv_hidden).view(batch_size, end, -1, self.head_dim)
-                        if self.v_proj is not None
-                        else full_key_states
-                    )
-                    full_key_states = self.k_norm(full_key_states)
-                    full_key_states = _apply_rotary_pos_emb(
-                        full_key_states,
-                        cos[:, :end, :],
-                        sin[:, :end, :],
-                        unsqueeze_dim=2,
-                    ).transpose(1, 2)
-                    full_value_states = self.v_norm(full_value_states).transpose(1, 2)
-
-        if need_full_store:
-            if full_key_states is None or full_value_states is None:
-                raise RuntimeError("full shared kv store requested but full kv states were not prepared")
-            shared_kv_states[self.layer_idx] = (full_key_states, full_value_states)
-
-        chunk_mask = None
-        if attention_mask is not None:
-            if attention_mask.dim() == 2:
-                chunk_mask = _make_chunk_attention_mask(
-                    attention_mask,
-                    start=start,
-                    end=end,
-                    kv_start=kv_start,
-                    kv_end=kv_end,
-                    dtype=query_states.dtype,
-                    device=query_states.device,
-                    sliding_window=sliding_window,
-                )
-            else:
-                chunk_mask = attention_mask[:, :, start:end, kv_start:kv_end]
-
-        attn_output, attn_weights = _stream_attention_forward(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            chunk_mask,
-        )
-        attn_output = attn_output.reshape(batch_size, chunk_len, -1)
-        attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
-
-    def prepare_replay_kv(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: torch.Tensor,
-        shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]],
-    ) -> None:
-        cos, sin = position_embeddings
-        if self.is_kv_shared_layer:
-            key_states, value_states = shared_kv_states[self.kv_shared_layer_index]
-            self._replay_key_states = key_states
-            self._replay_value_states = value_states
-            return
-
-        batch_size, seq_len = hidden_states.shape[:2]
-        key_states = self.k_proj(hidden_states).view(batch_size, seq_len, -1, self.head_dim)
-        value_states = self.v_proj(hidden_states).view(batch_size, seq_len, -1, self.head_dim) if self.v_proj is not None else key_states
-        key_states = self.k_norm(key_states)
-        key_states = _apply_rotary_pos_emb(key_states, cos, sin, unsqueeze_dim=2).transpose(1, 2)
-        value_states = self.v_norm(value_states).transpose(1, 2)
-        self._replay_key_states = key_states
-        self._replay_value_states = value_states
-        if self.store_full_length_kv:
-            shared_kv_states[self.layer_idx] = (key_states, value_states)
-
-    def clear_replay_cache(self) -> None:
-        self._replay_key_states = None
-        self._replay_value_states = None
-
-
-class _StreamGemmaDecoderLayer(nn.Module):
-    def __init__(self, base_layer: nn.Module, use_compile: bool = False):
-        super().__init__()
-        self.base_layer = base_layer
-        self._use_compile = use_compile
-        if not isinstance(self.base_layer.self_attn, _StreamGemmaAttention):
-            self.base_layer.self_attn = _StreamGemmaAttention(self.base_layer.self_attn)
-        self._replay_shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
-
-    def __getattr__(self, name: str):
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            return getattr(self.base_layer, name)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        per_layer_input: torch.Tensor = None,
-        shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
-        position_embeddings: torch.Tensor = None,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        past_key_values=None,
-        chunk_range: tuple[int, int] | None = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        if chunk_range is None:
-            return self.base_layer(
-                hidden_states=hidden_states,
-                per_layer_input=per_layer_input,
-                shared_kv_states=shared_kv_states,
-                position_embeddings=position_embeddings,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                **kwargs,
-            )
-
-        start, end = chunk_range
-        chunk_len = end - start
-        residual = hidden_states[:, start:end, :]
-        full_hidden_seq_len = hidden_states.shape[1]
-        use_replay_cache = self._replay_shared_kv_states is not None
-        if use_replay_cache:
-            hidden_states_norm = self.base_layer.input_layernorm(hidden_states[:, start:end, :])
-        else:
-            hidden_states_norm = self.base_layer.input_layernorm(hidden_states[:, :end, :])
-        attn_out, _ = self.base_layer.self_attn(
-            hidden_states=hidden_states_norm,
-            position_embeddings=position_embeddings,
-            attention_mask=attention_mask,
-            shared_kv_states=self._replay_shared_kv_states or shared_kv_states,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            chunk_range=chunk_range,
-            full_hidden_seq_len=full_hidden_seq_len,
-            **kwargs,
-        )
-        hidden_states_chunk = self.base_layer.post_attention_layernorm(attn_out)
-        hidden_states_chunk = residual + hidden_states_chunk
-
-        residual = hidden_states_chunk
-        hidden_states_chunk = self.base_layer.pre_feedforward_layernorm(hidden_states_chunk)
-        hidden_states_chunk = self.base_layer.mlp(hidden_states_chunk)
-
-        if getattr(self.base_layer, "enable_moe_block", False):
-            hidden_states_1 = self.base_layer.post_feedforward_layernorm_1(hidden_states_chunk)
-            hidden_states_flat = residual.reshape(-1, residual.shape[-1])
-            _, top_k_weights, top_k_index = self.base_layer.router(hidden_states_flat)
-            hidden_states_2 = self.base_layer.pre_feedforward_layernorm_2(hidden_states_flat)
-            hidden_states_2 = self.base_layer.experts(hidden_states_2, top_k_index, top_k_weights)
-            hidden_states_2 = hidden_states_2.reshape(residual.shape)
-            hidden_states_2 = self.base_layer.post_feedforward_layernorm_2(hidden_states_2)
-            hidden_states_chunk = hidden_states_1 + hidden_states_2
-
-        hidden_states_chunk = self.base_layer.post_feedforward_layernorm(hidden_states_chunk)
-        hidden_states_chunk = residual + hidden_states_chunk
-
-        if getattr(self.base_layer, "hidden_size_per_layer_input", 0):
-            residual = hidden_states_chunk
-            if per_layer_input is None:
-                raise RuntimeError("per_layer_input is required for chunked Gemma4 replay")
-            if per_layer_input.shape[1] != chunk_len:
-                per_layer_input = per_layer_input[:, start:end, :]
-            hidden_states_chunk = self.base_layer.per_layer_input_gate(hidden_states_chunk)
-            hidden_states_chunk = self.base_layer.act_fn(hidden_states_chunk)
-            hidden_states_chunk = hidden_states_chunk * per_layer_input
-            hidden_states_chunk = self.base_layer.per_layer_projection(hidden_states_chunk)
-            hidden_states_chunk = self.base_layer.post_per_layer_input_norm(hidden_states_chunk)
-            hidden_states_chunk = residual + hidden_states_chunk
-
-        return hidden_states_chunk * self.base_layer.layer_scalar
-
-    def prepare_for_replay(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: torch.Tensor,
-        shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]],
-    ) -> None:
-        self._replay_shared_kv_states = shared_kv_states
-        hidden_states_norm = self.base_layer.input_layernorm(hidden_states)
-        self.base_layer.self_attn.prepare_replay_kv(hidden_states_norm, position_embeddings, shared_kv_states)
-
-    def clear_replay_cache(self) -> None:
-        self._replay_shared_kv_states = None
-        self.base_layer.self_attn.clear_replay_cache()
-
-
-def _get_layer_types(inner_model) -> list[str]:
-    cfg = inner_model.config
-    if hasattr(cfg, "layer_types"):
-        return list(cfg.layer_types)
-    return ["full_attention"] * len(inner_model.layers)
-
-
-def _make_chunk_attention_mask(
-    raw_attention_mask: torch.Tensor | None,
-    *,
-    start: int,
-    end: int,
-    kv_start: int,
-    kv_end: int,
-    dtype: torch.dtype,
-    device: torch.device,
-    sliding_window: int | None = None,
-) -> torch.Tensor | None:
-    q_pos = torch.arange(start, end, device=device).unsqueeze(1)
-    k_pos = torch.arange(kv_start, kv_end, device=device).unsqueeze(0)
-    causal = k_pos <= q_pos
-    if sliding_window is not None:
-        causal = causal & ((q_pos - k_pos) < sliding_window)
-
-    mask = torch.zeros((end - start, kv_end - kv_start), device=device, dtype=dtype)
-    mask = mask.masked_fill(~causal, torch.finfo(dtype).min)
-    mask = mask.unsqueeze(0).unsqueeze(0)
-
-    if raw_attention_mask is not None:
-        pad = raw_attention_mask[:, kv_start:kv_end].to(device=device, non_blocking=True)
-        pad_mask = (pad == 0).unsqueeze(1).unsqueeze(2)
-        mask = mask.masked_fill(pad_mask, torch.finfo(dtype).min)
-    return mask
-
-
-def _build_mask_mapping(inner_model, hidden_states, attention_mask, position_ids, inputs_embeds_kwarg: str):
-    cfg = inner_model.config
-    mask_kwargs = {
-        "config": cfg,
-        inputs_embeds_kwarg: hidden_states,
-        "attention_mask": attention_mask,
-        "past_key_values": None,
-        "position_ids": position_ids,
-    }
-    if inputs_embeds_kwarg == "inputs_embeds":
-        mask_kwargs["cache_position"] = None
-    full_mask = create_causal_mask(**mask_kwargs)
-    sliding_mask = create_sliding_window_causal_mask(**mask_kwargs)
-    return {
-        "full_attention": full_mask,
-        "sliding_attention": sliding_mask,
-    }
-
-
-def _to_normal_tensor(tensor: torch.Tensor | None) -> torch.Tensor | None:
-    if tensor is None:
-        return None
-    with torch.inference_mode(False):
-        return tensor.clone().detach()
-
-
-def _build_runtime(
-    inner_model,
-    layer_types: list[str],
-    hidden_states: torch.Tensor,
-    attention_mask: torch.Tensor,
-    position_ids: torch.Tensor,
-    *,
-    build_full_masks: bool,
-    causal_mask_inputs_embeds_kwarg: str,
-) -> tuple[dict, dict]:
-    if build_full_masks:
-        mask_mapping = _build_mask_mapping(
-            inner_model,
-            hidden_states.detach(),
-            attention_mask,
-            position_ids,
-            causal_mask_inputs_embeds_kwarg,
-        )
-    else:
-        mask_mapping = {
-            layer_type: attention_mask
-            for layer_type in set(layer_types)
-        }
-
-    position_embeddings = {}
-    for layer_type in set(layer_types):
-        position_embeddings[layer_type] = inner_model.rotary_emb(
-            hidden_states.detach(),
-            position_ids,
-            layer_type=layer_type,
-        )
-    return mask_mapping, position_embeddings
-
-
-def _run_layer(
-    layer,
-    hidden_states: torch.Tensor,
-    mask_mapping: dict,
-    position_embeddings: dict,
-    position_ids: torch.Tensor,
-    shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]],
-    layer_type: str,
-    per_layer_input: torch.Tensor | None = None,
-    chunk_range: tuple[int, int] | None = None,
-) -> torch.Tensor:
-    output = layer(
-        hidden_states=hidden_states,
-        per_layer_input=per_layer_input,
-        shared_kv_states=shared_kv_states,
-        position_embeddings=position_embeddings.get(layer_type),
-        attention_mask=mask_mapping.get(layer_type, mask_mapping["full_attention"]),
-        position_ids=position_ids,
-        past_key_values=None,
-        chunk_range=chunk_range,
-    )
-    return output if not isinstance(output, tuple) else output[0]
+from .utils.attn import apply_rotary_pos_emb as _apply_rotary_pos_emb
+from .utils.attn import repeat_kv as _repeat_kv
+from .utils.gemma4_streaming import (
+    _COMPILE_MODE,
+    _build_runtime,
+    _get_layer_types,
+    _LayerReplay,
+    _normalize_chunk_size,
+    _run_layer,
+    _StreamCheckpointFunction,
+    _StreamGemmaAttention,
+    _StreamGemmaDecoderLayer,
+    _to_normal_tensor,
+)
+from .utils.lora import (
+    _adapter_state_keys,
+    _adapter_state_path,
+    _assert_clean_lora_adapter_dir,
+    _coerce_int_list,
+    _coerce_str_list,
+    _layer_indices_from_names,
+    _load_adapter_config_dict,
+    _lora_target_leaf,
+    _normalize_lora_adapter_dir,
+    _normalize_lora_state_key,
+    _normalized_lora_config_dict,
+)
+from .utils.prefix import PrefixBundle
+
+_functorch_config.donated_buffer = False
+
+_GEMMA4_DEFAULT_LORA_TARGETS = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+)
 
 
 class Gemma4Model(BaseModel):
@@ -680,12 +72,19 @@ class Gemma4Model(BaseModel):
         if hasattr(self.model, "config"):
             self.model.config.use_cache = False
 
-        self.lora = getattr(self.config, "lora")
+        self.lora = getattr(self.config, "lora", list(_GEMMA4_DEFAULT_LORA_TARGETS))
         self.lora_fraction = float(getattr(self.config, "lora_fraction", 0.5))
-        self._use_grad_checkpoint = bool(getattr(self.config, "use_grad_checkpoint", False))
+        self._use_grad_checkpoint = bool(
+            getattr(self.config, "use_grad_checkpoint", False)
+        )
         self._use_compile = bool(getattr(self.config, "use_compile", False))
-        self._offload_prefix_to_cpu = bool(getattr(self.config, "offload_prefix_to_cpu", False))
-        self._token_chunk_size = _normalize_chunk_size(getattr(self.config, "token_chunk_size", None))
+        self._offload_prefix_to_cpu = bool(
+            getattr(self.config, "offload_prefix_to_cpu", False)
+        )
+        self._lora_temp_dirs: list[tempfile.TemporaryDirectory] = []
+        self._token_chunk_size = _normalize_chunk_size(
+            getattr(self.config, "token_chunk_size", None)
+        )
         self._prefix_token_chunk_size = _normalize_chunk_size(
             getattr(self.config, "prefix_token_chunk_size", None)
         )
@@ -700,31 +99,53 @@ class Gemma4Model(BaseModel):
         self._inner_model, self._lm_head = self._resolve_text_stack(self.model)
         self._layers = self._inner_model.layers
         self._layer_types = _get_layer_types(self._inner_model)
-        self._prefix_split_layer = self._compute_prefix_end(len(self._layers), self.lora_fraction)
+        self._prefix_split_layer = self._compute_prefix_end(
+            len(self._layers), self.lora_fraction
+        )
         self._causal_mask_inputs_embeds_kwarg = (
             "inputs_embeds"
             if "inputs_embeds" in inspect.signature(create_causal_mask).parameters
             else "input_embeds"
         )
 
-        lora_targets = (
-            self.lora
-            if isinstance(self.lora, list)
-            else ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-        )
-        target_modules = self._suffix_lora_targets(lora_targets)
-
-        lora_rank = int(getattr(self.config, "lora_rank", 128))
-        lora_alpha = int(getattr(self.config, "lora_alpha", lora_rank * 2))
-        lora_cfg = LoraConfig(
-            r=lora_rank,
-            lora_alpha=lora_alpha,
-            lora_dropout=0.0,
-            bias="none",
-            task_type="CAUSAL_LM",
-            target_modules=target_modules,
-        )
-        self.model = get_peft_model(self.model, lora_cfg)
+        if self.lora_path:
+            lora_path = self._prepare_lora_path_for_load(self.lora_path)
+            self._infer_lora_metadata_from_adapter(lora_path)
+            self.model = PeftModel.from_pretrained(
+                self.model,
+                str(lora_path),
+                adapter_name=self.lora_adapter_name,
+                is_trainable=self.lora_is_trainable,
+            )
+        else:
+            lora_targets = self._requested_lora_targets()
+            suffix_layer_indices = list(
+                range(self._prefix_split_layer, len(self._layers))
+            )
+            target_modules = self._available_lora_leaf_targets(
+                lora_targets,
+                suffix_layer_indices,
+            )
+            lora_rank = int(getattr(self.config, "lora_rank", 128))
+            lora_alpha = int(getattr(self.config, "lora_alpha", lora_rank * 2))
+            self.lora = target_modules
+            self.lora_rank = lora_rank
+            self.lora_alpha = lora_alpha
+            lora_cfg = LoraConfig(
+                r=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=0.0,
+                bias="none",
+                task_type="CAUSAL_LM",
+                target_modules=target_modules,
+                layers_to_transform=suffix_layer_indices,
+                layers_pattern="layers",
+            )
+            self.model = get_peft_model(
+                self.model,
+                lora_cfg,
+                adapter_name=self.lora_adapter_name,
+            )
 
         self._inner_model, self._lm_head = self._resolve_text_stack(self.model)
         self._layers = self._inner_model.layers
@@ -735,7 +156,7 @@ class Gemma4Model(BaseModel):
         for param in self.model.parameters():
             param.requires_grad_(False)
         for name, param in self.model.named_parameters():
-            if "lora_" in name:
+            if "lora_" in name and self.lora_is_trainable:
                 param.requires_grad_(True)
 
     _SUFFIX_NORM_ATTRS = (
@@ -744,6 +165,163 @@ class Gemma4Model(BaseModel):
         "pre_feedforward_layernorm",
         "post_feedforward_layernorm",
     )
+
+    def _requested_lora_targets(self) -> list[str]:
+        if isinstance(self.lora, list):
+            return [str(target) for target in self.lora]
+        return list(_GEMMA4_DEFAULT_LORA_TARGETS)
+
+    def _prepare_lora_path_for_load(self, adapter_path: str) -> Path:
+        adapter_dir = Path(adapter_path).expanduser().resolve()
+        if not adapter_dir.is_dir():
+            raise FileNotFoundError(f"LoRA adapter path not found: {adapter_dir}")
+
+        state_path = _adapter_state_path(adapter_dir)
+        state_keys = _adapter_state_keys(state_path)
+        config_data = _load_adapter_config_dict(adapter_dir)
+        normalized_config = _normalized_lora_config_dict(config_data, state_keys)
+        dirty_config = normalized_config != config_data
+        dirty_state = any(_normalize_lora_state_key(key) != key for key in state_keys)
+        if not dirty_config and not dirty_state:
+            return adapter_dir
+
+        tmp = tempfile.TemporaryDirectory(prefix="gemma4_lora_")
+        self._lora_temp_dirs.append(tmp)
+        return _normalize_lora_adapter_dir(adapter_dir, Path(tmp.name))
+
+    def _infer_lora_metadata_from_adapter(self, adapter_path: Path) -> None:
+        peft_config = PeftConfig.from_pretrained(str(adapter_path))
+        config_data = _load_adapter_config_dict(adapter_path)
+
+        targets = _coerce_str_list(config_data.get("target_modules"))
+        if not targets:
+            targets = _coerce_str_list(getattr(peft_config, "target_modules", None))
+        self.lora = sorted({_lora_target_leaf(target) for target in targets})
+
+        self.lora_rank = int(getattr(peft_config, "r", config_data.get("r", 128)))
+        self.lora_alpha = int(
+            getattr(
+                peft_config,
+                "lora_alpha",
+                config_data.get("lora_alpha", self.lora_rank * 2),
+            )
+        )
+
+        layer_indices = _coerce_int_list(config_data.get("layers_to_transform"))
+        if not layer_indices:
+            layer_indices = _layer_indices_from_names(
+                _adapter_state_keys(_adapter_state_path(adapter_path))
+            )
+
+        if layer_indices:
+            self._prefix_split_layer = min(layer_indices)
+        else:
+            self._prefix_split_layer = 0
+        if len(self._layers) > 0:
+            self.lora_fraction = (len(self._layers) - self._prefix_split_layer) / len(
+                self._layers
+            )
+
+    def _available_lora_leaf_targets(
+        self,
+        requested_targets: list[str],
+        layer_indices: list[int],
+    ) -> list[str]:
+        requested = {str(target) for target in requested_targets}
+        if not requested:
+            raise ValueError("Gemma4 LoRA target list cannot be empty")
+        layer_index_set = set(layer_indices)
+        found = set()
+
+        for name, module in self.model.named_modules():
+            parts = name.split(".")
+            layer_idx = None
+            for i in range(len(parts) - 1):
+                if parts[i] == "layers" and parts[i + 1].isdigit():
+                    layer_idx = int(parts[i + 1])
+                    break
+            if layer_idx is None or layer_idx not in layer_index_set:
+                continue
+            leaf = parts[-1]
+            if leaf in requested and hasattr(module, "weight"):
+                found.add(leaf)
+
+        if not found:
+            raise ValueError(
+                "None of the requested Gemma4 LoRA targets exist in the selected suffix layers: "
+                f"{sorted(requested)}"
+            )
+        return sorted(found)
+
+    def load_lora_adapter(
+        self,
+        adapter_name: str,
+        adapter_path: str,
+        *,
+        is_trainable: bool = False,
+    ) -> None:
+        normalized_path = self._prepare_lora_path_for_load(adapter_path)
+        unwrapped = self._unwrap_streaming_layers_for_peft()
+        try:
+            super().load_lora_adapter(
+                adapter_name,
+                str(normalized_path),
+                is_trainable=is_trainable,
+            )
+        finally:
+            if unwrapped:
+                self._wrap_suffix_layers_for_streaming()
+
+    def save_lora_adapter(self, adapter_name: str, save_path: str) -> None:
+        save_dir = Path(save_path).expanduser().resolve()
+        if not hasattr(self.model, "peft_config"):
+            raise RuntimeError("Model is not a PEFT model")
+        actual_adapters = list(self.model.peft_config.keys())
+        if not actual_adapters:
+            raise RuntimeError("No LoRA adapters found in model")
+
+        save_name = (
+            adapter_name if adapter_name in actual_adapters else actual_adapters[0]
+        )
+        unwrapped = self._unwrap_streaming_layers_for_peft()
+        try:
+            self.model.save_pretrained(str(save_dir), selected_adapters=[save_name])
+        finally:
+            if unwrapped:
+                self._wrap_suffix_layers_for_streaming()
+
+        adapter_dir = save_dir / save_name if save_name != "default" else save_dir
+        if adapter_dir != save_dir and adapter_dir.exists():
+            for child in adapter_dir.iterdir():
+                dst = save_dir / child.name
+                if dst.exists():
+                    if dst.is_dir():
+                        shutil.rmtree(dst)
+                    else:
+                        dst.unlink()
+                shutil.move(str(child), str(dst))
+            adapter_dir.rmdir()
+
+        _normalize_lora_adapter_dir(save_dir)
+        _assert_clean_lora_adapter_dir(save_dir)
+
+    def _unwrap_streaming_layers_for_peft(self) -> bool:
+        changed = False
+        for idx, layer in enumerate(self._inner_model.layers):
+            if isinstance(layer, _StreamGemmaDecoderLayer):
+                base_layer = layer.base_layer
+                if isinstance(base_layer.self_attn, _StreamGemmaAttention):
+                    base_layer.self_attn = base_layer.self_attn.base_attn
+                self._inner_model.layers[idx] = base_layer
+                changed = True
+            elif hasattr(layer, "self_attn") and isinstance(
+                layer.self_attn, _StreamGemmaAttention
+            ):
+                layer.self_attn = layer.self_attn.base_attn
+                changed = True
+        if changed:
+            self._layers = self._inner_model.layers
+        return changed
 
     def _wrap_suffix_layers_for_streaming(self) -> None:
         use_compile = self._use_compile
@@ -759,7 +337,9 @@ class Gemma4Model(BaseModel):
                 # prefix work and grad-enabled replay, and compiled RMSNorm modules
                 # hit Dynamo's recompile limit under that mixed-mode workload.
                 if hasattr(base, "mlp") and base.mlp is not None:
-                    base.mlp = torch.compile(base.mlp, dynamic=True, fullgraph=True, mode=_COMPILE_MODE)
+                    base.mlp = torch.compile(
+                        base.mlp, dynamic=True, fullgraph=True, mode=_COMPILE_MODE
+                    )
             self._inner_model.layers[idx] = new_layer
         self._layers = self._inner_model.layers
 
@@ -812,23 +392,25 @@ class Gemma4Model(BaseModel):
             return 0
         return int(math.floor(n_layers * (1.0 - frac)))
 
-    def _suffix_lora_targets(self, requested_targets: list[str]) -> list[str]:
-        target_leaves = set(requested_targets)
-        targets: list[str] = []
-        for name, module in self.model.named_modules():
-            if "language_model.layers." not in name:
-                continue
-            parts = name.split(".")
-            layer_idx = None
-            for i in range(len(parts) - 1):
-                if parts[i] == "layers" and parts[i + 1].isdigit():
-                    layer_idx = int(parts[i + 1])
-                    break
-            if layer_idx is None or layer_idx < self._prefix_split_layer:
-                continue
-            if parts[-1] in target_leaves and hasattr(module, "weight"):
-                targets.append(name)
-        return sorted(set(targets))
+    def _debug_lora_state(self) -> dict:
+        total = sum(p.numel() for p in self.model.parameters())
+        lora_params = {n: p for n, p in self.model.named_parameters() if "lora_" in n}
+        trainable_lora = sum(p.numel() for p in lora_params.values() if p.requires_grad)
+        sample = next(iter(lora_params), None)
+        return {
+            "total_params": total,
+            "lora_params": sum(p.numel() for p in lora_params.values()),
+            "trainable_lora": trainable_lora,
+            "sample_lora_name": sample,
+            "peft_config_keys": list(getattr(self.model, "peft_config", {}).keys()),
+            "prefix_split_layer": self._prefix_split_layer,
+        }
+
+    def _postprocess_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        softcap = getattr(self._inner_model.config, "final_logit_softcapping", None)
+        if softcap is not None:
+            logits = torch.tanh(logits / softcap) * softcap
+        return logits
 
     def _get_per_layer_inputs(self, input_ids: torch.Tensor) -> torch.Tensor | None:
         if not getattr(self._inner_model.config, "hidden_size_per_layer_input", None):
@@ -843,7 +425,9 @@ class Gemma4Model(BaseModel):
     ) -> torch.Tensor | None:
         if per_layer_inputs is None:
             return None
-        return self._inner_model.project_per_layer_inputs(hidden_states, per_layer_inputs)
+        return self._inner_model.project_per_layer_inputs(
+            hidden_states, per_layer_inputs
+        )
 
     def _mask_mapping_has_full_masks(self, mask_mapping: dict | None) -> bool:
         if mask_mapping is None:
@@ -887,24 +471,14 @@ class Gemma4Model(BaseModel):
             for key, (key_states, value_states) in shared_kv_states.items()
         }
 
-    def _move_tensor(self, tensor: torch.Tensor | None, device: torch.device) -> torch.Tensor | None:
+    def _move_tensor(
+        self, tensor: torch.Tensor | None, device: torch.device
+    ) -> torch.Tensor | None:
         if tensor is None:
             return None
         if tensor.device == device:
             return tensor
         return tensor.to(device=device, non_blocking=True)
-
-    def _move_tensor_slice(
-        self,
-        tensor: torch.Tensor | None,
-        device: torch.device,
-        seq_end: int | None = None,
-    ) -> torch.Tensor | None:
-        if tensor is None:
-            return None
-        if seq_end is not None:
-            tensor = tensor[:, :seq_end, ...]
-        return self._move_tensor(tensor, device)
 
     def _materialize_shared_kv_states(
         self,
@@ -923,8 +497,8 @@ class Gemma4Model(BaseModel):
             )
         return materialized
 
-    def _offload_prefix_bundle_to_cpu(self, bundle: _PrefixBundle) -> _PrefixBundle:
-        return _PrefixBundle(
+    def _offload_prefix_bundle_to_cpu(self, bundle: PrefixBundle) -> PrefixBundle:
+        return PrefixBundle(
             hidden_prefix=bundle.hidden_prefix.to("cpu", non_blocking=True),
             position_ids=bundle.position_ids.to("cpu", non_blocking=True),
             shared_kv_states={
@@ -945,12 +519,19 @@ class Gemma4Model(BaseModel):
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> _PrefixBundle:
-        hidden_prefix, position_ids, shared_kv_states, per_layer_inputs, mask_mapping, position_embeddings = self._forward_prefix(
+    ) -> PrefixBundle:
+        (
+            hidden_prefix,
+            position_ids,
+            shared_kv_states,
+            per_layer_inputs,
+            mask_mapping,
+            position_embeddings,
+        ) = self._forward_prefix(
             input_ids,
             attention_mask,
         )
-        bundle = _PrefixBundle(
+        bundle = PrefixBundle(
             hidden_prefix=_to_normal_tensor(hidden_prefix),
             position_ids=_to_normal_tensor(position_ids),
             shared_kv_states=self._detach_shared_kv_states(shared_kv_states),
@@ -964,7 +545,7 @@ class Gemma4Model(BaseModel):
 
     def _prepare_suffix_inputs_from_bundle(
         self,
-        bundle: _PrefixBundle,
+        bundle: PrefixBundle,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -987,11 +568,12 @@ class Gemma4Model(BaseModel):
 
     def _run_suffix_from_prefix_bundle(
         self,
-        bundle: _PrefixBundle,
+        bundle: PrefixBundle,
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
-        hidden_for_suffix, position_ids, shared_kv_states, per_layer_inputs = self._prepare_suffix_inputs_from_bundle(
-            bundle
+        bundle = bundle.clone_for_autograd()
+        hidden_for_suffix, position_ids, shared_kv_states, per_layer_inputs = (
+            self._prepare_suffix_inputs_from_bundle(bundle)
         )
         return self._forward_suffix(
             hidden_for_suffix,
@@ -1035,10 +617,14 @@ class Gemma4Model(BaseModel):
 
         shared_kv_states = {}
         raw_per_layer_inputs = self._get_per_layer_inputs(input_ids)
-        per_layer_inputs = self._project_per_layer_inputs(hidden_states, raw_per_layer_inputs)
+        per_layer_inputs = self._project_per_layer_inputs(
+            hidden_states, raw_per_layer_inputs
+        )
 
         for idx, layer in enumerate(self._layers[: self._prefix_split_layer]):
-            per_layer_input = per_layer_inputs[:, :, idx, :] if per_layer_inputs is not None else None
+            per_layer_input = (
+                per_layer_inputs[:, :, idx, :] if per_layer_inputs is not None else None
+            )
             if use_chunked_prefix and isinstance(layer, _StreamGemmaDecoderLayer):
                 layer.prepare_for_replay(
                     hidden_states,
@@ -1076,7 +662,14 @@ class Gemma4Model(BaseModel):
                     per_layer_input=per_layer_input,
                 )
 
-        return hidden_states, position_ids, shared_kv_states, per_layer_inputs, mask_mapping, position_embeddings
+        return (
+            hidden_states,
+            position_ids,
+            shared_kv_states,
+            per_layer_inputs,
+            mask_mapping,
+            position_embeddings,
+        )
 
     def _forward_suffix(
         self,
@@ -1090,13 +683,16 @@ class Gemma4Model(BaseModel):
         prebuilt_position_embeddings: dict | None = None,
     ) -> torch.Tensor:
         use_streaming_suffix = (
-            self._use_grad_checkpoint and torch.is_grad_enabled() and self._suffix_token_chunk_size > 0
+            self._use_grad_checkpoint
+            and torch.is_grad_enabled()
+            and self._suffix_token_chunk_size > 0
         )
         build_full_masks = not use_streaming_suffix
         can_reuse_prebuilt = (
             prebuilt_mask_mapping is not None
             and prebuilt_position_embeddings is not None
-            and self._mask_mapping_has_full_masks(prebuilt_mask_mapping) == build_full_masks
+            and self._mask_mapping_has_full_masks(prebuilt_mask_mapping)
+            == build_full_masks
         )
         if can_reuse_prebuilt:
             mask_mapping = prebuilt_mask_mapping
@@ -1134,250 +730,10 @@ class Gemma4Model(BaseModel):
                     hidden_states,
                 )
             elif self._use_grad_checkpoint and torch.is_grad_enabled():
-                hidden_states = torch.utils.checkpoint.checkpoint(layer_replay, hidden_states, use_reentrant=False)
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    layer_replay, hidden_states, use_reentrant=False
+                )
             else:
                 hidden_states = layer_replay(hidden_states)
 
         return self._inner_model.norm(hidden_states)
-
-    def _lm_head_logits_chunked(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        seq_len = hidden_states.shape[1]
-        chunk = seq_len if self.chunk_size is None else max(1, int(self.chunk_size))
-        logits_parts = []
-        softcap = getattr(self._inner_model.config, "final_logit_softcapping", None)
-
-        for start in range(0, seq_len, chunk):
-            end = min(start + chunk, seq_len)
-            logits = self._lm_head(hidden_states[:, start:end, :])
-            if softcap is not None:
-                logits = torch.tanh(logits / softcap) * softcap
-            logits_parts.append(logits)
-
-        return torch.cat(logits_parts, dim=1)
-
-    def _token_logprobs_chunked(
-        self,
-        hidden_comp: torch.Tensor,
-        token_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        completion_len = hidden_comp.shape[1]
-        chunk_source = self.logprob_chunk_size if self.logprob_chunk_size is not None else self.chunk_size
-        chunk = completion_len if chunk_source is None else max(1, int(chunk_source))
-        softcap = getattr(self._inner_model.config, "final_logit_softcapping", None)
-        token_logprob_chunks = []
-
-        for start in range(0, completion_len, chunk):
-            end = min(start + chunk, completion_len)
-            logits = self._lm_head(hidden_comp[:, start:end, :])
-            if softcap is not None:
-                logits = torch.tanh(logits / softcap) * softcap
-            target_ids = token_ids[:, start:end].to(hidden_comp.device, non_blocking=True)
-            token_logprob_chunks.append(
-                torch.log_softmax(logits.float(), dim=-1)
-                .gather(dim=-1, index=target_ids.unsqueeze(-1))
-                .squeeze(-1)
-            )
-
-        return torch.cat(token_logprob_chunks, dim=1)
-
-    def _backward_masked_mean_logprob_chunked(
-        self,
-        hidden_comp: torch.Tensor,
-        token_ids: torch.Tensor,
-        token_mask: torch.Tensor,
-        *,
-        loss_scale: float,
-    ) -> tuple[float, float]:
-        completion_len = hidden_comp.shape[1]
-        chunk_source = self.logprob_chunk_size if self.logprob_chunk_size is not None else self.chunk_size
-        chunk = completion_len if chunk_source is None else max(1, int(chunk_source))
-        softcap = getattr(self._inner_model.config, "final_logit_softcapping", None)
-        valid_tokens = token_mask.sum().clamp(min=1.0)
-        total_logp_sum = 0.0
-
-        # Detach hidden_comp so lm_head chunk backward does NOT traverse the suffix graph.
-        # Accumulate dL/d_hidden_comp across all chunks, then do ONE backward through suffix.
-        hidden_comp_detach = hidden_comp.detach().requires_grad_(True)
-
-        for start in range(0, completion_len, chunk):
-            end = min(start + chunk, completion_len)
-            logits = self._lm_head(hidden_comp_detach[:, start:end, :])
-            if softcap is not None:
-                logits = torch.tanh(logits / softcap) * softcap
-            target_ids = token_ids[:, start:end].to(hidden_comp.device, non_blocking=True)
-            mask_slice = token_mask[:, start:end]
-            token_logprobs = torch.log_softmax(logits.float(), dim=-1).gather(
-                dim=-1,
-                index=target_ids.unsqueeze(-1),
-            ).squeeze(-1)
-            chunk_loss = -((token_logprobs * mask_slice).sum() / valid_tokens)
-            # backward only through lm_head; gradients accumulate into hidden_comp_detach.grad
-            (chunk_loss * float(loss_scale)).backward()
-            with torch.no_grad():
-                total_logp_sum += float((token_logprobs * mask_slice).sum().item())
-
-        # Single backward through suffix graph with fully accumulated gradient.
-        hidden_comp.backward(gradient=hidden_comp_detach.grad)
-
-        valid_tokens_value = float(valid_tokens.item())
-        mean_logp = total_logp_sum / valid_tokens_value
-        total_loss = -total_logp_sum / valid_tokens_value
-        return total_loss, mean_logp
-
-    def forward(self, messages: list[list[dict]]):
-        prompts = [
-            self.tokenizer.apply_chat_template(
-                convo,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            for convo in messages
-        ]
-        tokenized = self.tokenizer(prompts, return_tensors="pt", padding=True)
-        model_device = self._model_device
-        input_ids = tokenized["input_ids"].to(model_device, non_blocking=True)
-        attention_mask = tokenized["attention_mask"].to(model_device, non_blocking=True)
-
-        with torch.inference_mode():
-            prefix_bundle = self._build_prefix_bundle(input_ids, attention_mask)
-            hidden_suffix = self._run_suffix_from_prefix_bundle(prefix_bundle, attention_mask)
-            return self._lm_head_logits_chunked(hidden_suffix)
-
-    def backward(
-        self,
-        messages: list[list[dict]],
-        completion_texts: list[str],
-        loss_fn: Callable,
-        loss_scale: float = 1.0,
-    ) -> dict[str, float]:
-        if not completion_texts:
-            raise ValueError("completion_texts cannot be empty")
-
-        prompts = [
-            self.tokenizer.apply_chat_template(
-                convo,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            for convo in messages
-        ]
-        model_device = self._model_device
-        num_generations = len(completion_texts)
-        if len(prompts) == 1 and num_generations > 1:
-            prompts = prompts * num_generations
-        if len(prompts) != num_generations:
-            raise ValueError(
-                f"prompt batch ({len(prompts)}) must be 1 or match completion batch ({num_generations})"
-            )
-
-        prompt_token_lists = self.tokenizer(
-            prompts,
-            add_special_tokens=False,
-            return_attention_mask=False,
-        )["input_ids"]
-        completion_token_lists = self.tokenizer(
-            completion_texts,
-            add_special_tokens=False,
-            return_attention_mask=False,
-        )["input_ids"]
-        full_token_lists = [
-            prompt_ids + completion_ids
-            for prompt_ids, completion_ids in zip(prompt_token_lists, completion_token_lists)
-        ]
-        max_total_len = max(len(ids) for ids in full_token_lists)
-        pad_token_id = self.tokenizer.pad_token_id
-        if pad_token_id is None:
-            raise ValueError("tokenizer.pad_token_id must be set")
-
-        full_ids_cpu = []
-        full_mask_cpu = []
-        target_ids_cpu = []
-        completion_target_mask_cpu = []
-        for prompt_ids, completion_ids, full_ids_list in zip(
-            prompt_token_lists,
-            completion_token_lists,
-            full_token_lists,
-        ):
-            pad_len = max_total_len - len(full_ids_list)
-            full_ids_cpu.append(full_ids_list + ([pad_token_id] * pad_len))
-            full_mask_cpu.append(([1] * len(full_ids_list)) + ([0] * pad_len))
-            target_ids_cpu.append(full_ids_list[1:] + ([pad_token_id] * (pad_len + 1)))
-            completion_target_mask_cpu.append(
-                ([0] * max(0, len(prompt_ids) - 1))
-                + ([1] * len(completion_ids))
-                + ([0] * pad_len)
-            )
-
-        full_ids = torch.tensor(full_ids_cpu, device=model_device, dtype=torch.long)
-        full_mask = torch.tensor(full_mask_cpu, device=model_device, dtype=torch.long)
-        target_ids = torch.tensor(target_ids_cpu, device=model_device, dtype=torch.long)
-        completion_mask = torch.tensor(
-            completion_target_mask_cpu,
-            device=model_device,
-            dtype=torch.float32,
-        )
-
-        with torch.inference_mode():
-            prefix_bundle = self._build_prefix_bundle(full_ids, full_mask)
-        # Clone mask/pos_emb out of inference mode so they can participate in autograd graph.
-        if prefix_bundle.mask_mapping is not None:
-            prefix_bundle.mask_mapping = {
-                k: v.clone() if v is not None else None
-                for k, v in prefix_bundle.mask_mapping.items()
-            }
-        if prefix_bundle.position_embeddings is not None:
-            prefix_bundle.position_embeddings = {
-                k: (cos.clone(), sin.clone())
-                for k, (cos, sin) in prefix_bundle.position_embeddings.items()
-            }
-
-        with torch.enable_grad():
-            hidden_suffix = self._run_suffix_from_prefix_bundle(prefix_bundle, full_mask)
-            hidden_comp = hidden_suffix[:, :-1, :]
-            batch_logprobs = None
-
-            batch_loss_callable = None
-            explicit_batch = getattr(loss_fn, "loss_fn_batch", None)
-            if callable(explicit_batch):
-                batch_loss_callable = explicit_batch
-            elif getattr(loss_fn, "__name__", "") == "loss_fn_batch":
-                batch_loss_callable = loss_fn
-
-            mean_logp = None
-            if batch_loss_callable is not None:
-                stream_mode = getattr(batch_loss_callable, "_streaming_reduction", None)
-                if stream_mode == "masked_mean_logprob":
-                    total_loss, mean_logp = self._backward_masked_mean_logprob_chunked(
-                        hidden_comp,
-                        target_ids,
-                        completion_mask,
-                        loss_scale=float(loss_scale),
-                    )
-                else:
-                    batch_logprobs = self._token_logprobs_chunked(hidden_comp, target_ids)
-                    total_loss_t = batch_loss_callable(batch_logprobs, completion_mask, hidden_comp)
-                    (total_loss_t * float(loss_scale)).backward()
-                    total_loss = float(total_loss_t.item())
-            else:
-                batch_logprobs = self._token_logprobs_chunked(hidden_comp, target_ids)
-                total_loss = 0.0
-                for idx in range(num_generations):
-                    sample_loss = loss_fn(batch_logprobs[idx], idx, hidden_comp[idx])
-                    retain_graph = idx < (num_generations - 1)
-                    (sample_loss * float(loss_scale)).backward(retain_graph=retain_graph)
-                    total_loss += float(sample_loss.item())
-                total_loss = total_loss / max(1, num_generations)
-
-        with torch.no_grad():
-            valid_tokens = completion_mask.sum().clamp(min=1.0)
-            if mean_logp is None:
-                if batch_logprobs is None:
-                    batch_logprobs = self._token_logprobs_chunked(hidden_comp, target_ids)
-                mean_logp = float((batch_logprobs * completion_mask).sum().item() / valid_tokens.item())
-
-        return {
-            "loss": float(total_loss),
-            "mean_logp": mean_logp,
-            "batch_size": float(num_generations),
-            "valid_tokens": float(completion_mask.sum().item()),
-        }

@@ -3,12 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.tools import StructuredTool
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_openai import OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_chroma import Chroma
 from pydantic import BaseModel, Field
 
 
@@ -69,7 +69,9 @@ def build_markdown_rag_tool(
     )
     chunks = splitter.split_documents(docs)
     if not chunks:
-        raise ValueError(f"No text chunks produced from markdown files at: {docs_folder}")
+        raise ValueError(
+            f"No text chunks produced from markdown files at: {docs_folder}"
+        )
 
     if embedding_backend == "huggingface":
         embeddings = HuggingFaceEmbeddings(

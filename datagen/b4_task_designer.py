@@ -10,19 +10,24 @@ Each variant has:
 
 Output files are consumed by b4_code_writer.py
 """
+
 from __future__ import annotations
-import asyncio
+
 import argparse
+import asyncio
 import importlib
 import json
 import os
 from pathlib import Path
 
 from agents.master_agent import MasterAgent
+from agents.prompt_builder import (
+    extract_function_name,
+    load_raw_function,
+    raw_to_string,
+)
 from agents.prompts import TASK_DESIGNER_PROMPT
-from agents.prompt_builder import load_raw_function, extract_function_name, raw_to_string
 from agents.schemas import MultiTaskOutput
-
 
 VARIANT_INSTRUCTION = """\
 Design {n} DIFFERENT coding tasks that use `{fn_name}` as the target function.
@@ -120,13 +125,21 @@ async def process_function(
 
 async def main():
     parser = argparse.ArgumentParser(description="b4: Task Designer")
-    parser.add_argument("--input-dir",        required=True, help="Folder with per-function JSON files")
-    parser.add_argument("--output-dir",       required=True, help="Folder for task spec outputs")
-    parser.add_argument("--config",           required=True, help="JSON file with LLM config")
+    parser.add_argument(
+        "--input-dir", required=True, help="Folder with per-function JSON files"
+    )
+    parser.add_argument(
+        "--output-dir", required=True, help="Folder for task spec outputs"
+    )
+    parser.add_argument("--config", required=True, help="JSON file with LLM config")
     parser.add_argument("--mcp-tools-module", required=True)
     parser.add_argument("--tasks-per-function", type=int, default=3)
-    parser.add_argument("--concurrency",      type=int, default=3,
-                        help="b4 designers are heavy — keep this low")
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=3,
+        help="b4 designers are heavy — keep this low",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -138,9 +151,11 @@ async def main():
     specialist_tools = tools_mod.tools
 
     json_files = sorted(Path(args.input_dir).glob("*.json"))
-    print(f"[b4-design] Found {len(json_files)} functions, "
-          f"{args.tasks_per_function} tasks each = "
-          f"{len(json_files) * args.tasks_per_function} total tasks")
+    print(
+        f"[b4-design] Found {len(json_files)} functions, "
+        f"{args.tasks_per_function} tasks each = "
+        f"{len(json_files) * args.tasks_per_function} total tasks"
+    )
 
     semaphore = asyncio.Semaphore(args.concurrency)
 
@@ -148,8 +163,11 @@ async def main():
         async with semaphore:
             try:
                 return await process_function(
-                    str(path), config, specialist_tools,
-                    args.output_dir, args.tasks_per_function,
+                    str(path),
+                    config,
+                    specialist_tools,
+                    args.output_dir,
+                    args.tasks_per_function,
                 )
             except Exception as e:
                 print(f"[b4-design] ERROR {path.name}: {e}")
@@ -157,11 +175,13 @@ async def main():
 
     results = await asyncio.gather(*[bounded(p) for p in json_files])
 
-    designed    = sum(1 for r in results if isinstance(r, MultiTaskOutput))
+    designed = sum(1 for r in results if isinstance(r, MultiTaskOutput))
     total_tasks = sum(len(r.tasks) for r in results if isinstance(r, MultiTaskOutput))
-    errors      = sum(1 for r in results if r is None)
+    errors = sum(1 for r in results if r is None)
     print(f"\n{'='*50}")
-    print(f"b4-design SUMMARY: {designed} functions | {total_tasks} tasks | {errors} errors")
+    print(
+        f"b4-design SUMMARY: {designed} functions | {total_tasks} tasks | {errors} errors"
+    )
     print(f"{'='*50}")
 
 

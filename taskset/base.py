@@ -51,6 +51,7 @@ class BaseVerifier(ABC):
         Must raise SystemExit on hard failure.
         """
 
+
 class BaseDataset(ABC):
     @abstractmethod
     def n_buckets(self) -> int: ...

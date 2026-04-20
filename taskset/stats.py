@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from typing import Dict, List
 
+
 # What this class does:
 # - Writes per-step curriculum stats to a JSONL file.
 # - Can also read the full saved history back.

@@ -6,9 +6,10 @@ from pathlib import Path
 from typing import Deque, Dict, List, Optional, Tuple
 
 from .base import Problem, ProblemState, Score
+from .codeforces.dataset import CodeforcesDataset
 from .curriculum import BucketDistribution
 from .stats import StatsWriter
-from .codeforces.dataset import CodeforcesDataset
+
 
 # What this class does:
 # - Controls curriculum sampling, state updates, checkpointing, and stop logic.
@@ -65,13 +66,21 @@ class CurriculumLoader:
         self.rolling_window = int(rolling_window)
         self.require_full_bucket_coverage = bool(require_full_bucket_coverage)
 
-        self.dataset = dataset if dataset is not None else CodeforcesDataset(data_dir=str(self.dataset_dir))
+        self.dataset = (
+            dataset
+            if dataset is not None
+            else CodeforcesDataset(data_dir=str(self.dataset_dir))
+        )
         if self.distribution.n_buckets != self.dataset.n_buckets():
             raise ValueError(
                 f"distribution n_buckets ({self.distribution.n_buckets}) != dataset n_buckets ({self.dataset.n_buckets()})"
             )
 
-        self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir is not None else self.dataset_dir.parent / "checkpoint"
+        self.checkpoint_dir = (
+            Path(checkpoint_dir)
+            if checkpoint_dir is not None
+            else self.dataset_dir.parent / "checkpoint"
+        )
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoint_path = self.checkpoint_dir / "problem_states.json"
 
@@ -147,7 +156,11 @@ class CurriculumLoader:
         min_attempts = None
         least_sampled: List[Problem] = []
         for p in candidates:
-            attempts = self.problem_states.get(p.id).total_attempts if p.id in self.problem_states else 0
+            attempts = (
+                self.problem_states.get(p.id).total_attempts
+                if p.id in self.problem_states
+                else 0
+            )
             if min_attempts is None or attempts < min_attempts:
                 min_attempts = attempts
                 least_sampled = [p]
@@ -205,7 +218,10 @@ class CurriculumLoader:
                 continue
             if not (lo <= s.bucket <= hi):
                 continue
-            if s.solve_rate >= self.solve_threshold and s.consecutive_solves >= self.consecutive_required:
+            if (
+                s.solve_rate >= self.solve_threshold
+                and s.consecutive_solves >= self.consecutive_required
+            ):
                 s.promoted = True
                 promoted += 1
         return promoted
@@ -251,9 +267,7 @@ class CurriculumLoader:
             threshold=self.solve_threshold,
             consecutive_required=self.consecutive_required,
             min_evaluated=self.min_evaluated,
-        ) and (
-            (not self.require_full_bucket_coverage) or self._window_fully_covered()
-        ):
+        ) and ((not self.require_full_bucket_coverage) or self._window_fully_covered()):
             promoted = self._promote_mastered()
             self.distribution.shift_right(self.shift_delta)
             if self.distribution.is_exhausted(self.problem_states.values()):
@@ -311,7 +325,9 @@ class CurriculumLoader:
                 self._history[pid] = deque(maxlen=self.rolling_window)
 
             st = self.problem_states[pid]
-            solved = int(sc.total > 0 and (sc.passed / sc.total) >= self.solve_threshold)
+            solved = int(
+                sc.total > 0 and (sc.passed / sc.total) >= self.solve_threshold
+            )
             hist = self._history.setdefault(pid, deque(maxlen=self.rolling_window))
             hist.append(solved)
 
@@ -335,7 +351,9 @@ class CurriculumLoader:
 
         mean_score = 0.0
         if scores:
-            mean_score = sum((sc.passed / sc.total) if sc.total else 0.0 for sc in scores) / len(scores)
+            mean_score = sum(
+                (sc.passed / sc.total) if sc.total else 0.0 for sc in scores
+            ) / len(scores)
 
         self.stats.write(
             step=step,

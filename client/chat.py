@@ -54,16 +54,26 @@ class ChatClient(BaseClient):
             llm = llm.bind(reasoning_effort=reasoning_effort)
 
         if output_model is not None:
-            response: BaseModel = await llm.with_structured_output(output_model).ainvoke(messages)
-            self.message_history += [messages[-1], AIMessage(content=response.model_dump_json())]
+            response: BaseModel = await llm.with_structured_output(
+                output_model
+            ).ainvoke(messages)
+            self.message_history += [
+                messages[-1],
+                AIMessage(content=response.model_dump_json()),
+            ]
             return "", response
 
         # ChatOpenAI silently drops reasoning_content during message conversion
         # (langchain-ai/langchain#34706) — use the raw openai client to preserve it
         payload = [
-            {"role": "system" if isinstance(m, SystemMessage) else
-                     "assistant" if isinstance(m, AIMessage) else "user",
-             "content": str(m.content)}
+            {
+                "role": (
+                    "system"
+                    if isinstance(m, SystemMessage)
+                    else "assistant" if isinstance(m, AIMessage) else "user"
+                ),
+                "content": str(m.content),
+            }
             for m in messages
         ]
         raw = await self.llm.async_client.create(
@@ -75,8 +85,9 @@ class ChatClient(BaseClient):
         )
         msg = raw.choices[0].message
         content = str(msg.content or "")
-        reasoning = str(getattr(msg, "reasoning_content", "") or
-                        getattr(msg, "reasoning", "") or "")
+        reasoning = str(
+            getattr(msg, "reasoning_content", "") or getattr(msg, "reasoning", "") or ""
+        )
 
         self.message_history += [messages[-1], AIMessage(content=content)]
         return reasoning, content

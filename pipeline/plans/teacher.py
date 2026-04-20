@@ -20,7 +20,6 @@ import torch
 from torch import Tensor
 from tqdm.auto import tqdm
 
-
 # ---------------------------------------------------------------------------
 # TrainConfig additions (add these fields to your existing dataclass)
 # ---------------------------------------------------------------------------
@@ -34,6 +33,7 @@ from tqdm.auto import tqdm
 # ---------------------------------------------------------------------------
 # Updated train() teacher construction (replace the block in train())
 # ---------------------------------------------------------------------------
+
 
 def _build_teacher_client(cfg, profile):
     """
@@ -65,6 +65,7 @@ def _build_teacher_client(cfg, profile):
 # Helper: resolve ref_answer → single string or None
 # ---------------------------------------------------------------------------
 
+
 def _sample_ref_answer(problem) -> Optional[str]:
     """
     problem.metadata['answer'] may be:
@@ -87,13 +88,14 @@ def _sample_ref_answer(problem) -> Optional[str]:
 # _teacher_refine  (replace the existing method on GRPOPipeline)
 # ---------------------------------------------------------------------------
 
+
 async def _teacher_refine(
     self,
     candidates: list[dict],
     generate_fn,
     score_fn,
-    teacher_client,           # used as a config template; a fresh stateful
-                              # AgentClient is created per candidate
+    teacher_client,  # used as a config template; a fresh stateful
+    # AgentClient is created per candidate
 ) -> tuple[list[dict], int, int]:
     """
     For each failed candidate:
@@ -118,12 +120,16 @@ async def _teacher_refine(
     from client.agent import AgentClient
 
     async def _refine_one(rec: dict) -> tuple[dict, int, int]:
-        problem      = rec["problem"]
+        problem = rec["problem"]
         current_text = str(rec["text"])
         current_score = rec["score"]
-        best_text, best_score, best_reward = current_text, current_score, float(rec["reward"])
-        solved       = False
-        local_hints  = 0
+        best_text, best_score, best_reward = (
+            current_text,
+            current_score,
+            float(rec["reward"]),
+        )
+        solved = False
+        local_hints = 0
 
         # Resolve reference answer once per candidate (str | None).
         ref_answer = _sample_ref_answer(problem)
@@ -214,7 +220,7 @@ async def _teacher_refine(
             retry_reward *= cfg.hint_reward_discount
 
             # Update current attempt for the next teacher turn.
-            current_text  = retry_text
+            current_text = retry_text
             current_score = retry_sc
 
             if retry_reward > best_reward:
@@ -238,20 +244,20 @@ async def _teacher_refine(
         # ------------------------------------------------------------------
         sft_target = None
         if not solved and ref_answer:
-            sft_target = ref_answer   # already sampled above
+            sft_target = ref_answer  # already sampled above
 
         return (
             dict(
                 problem=problem,
                 messages=[
                     {"role": "system", "content": cfg.system_prompt},
-                    {"role": "user",   "content": str(problem.statement)},
+                    {"role": "user", "content": str(problem.statement)},
                 ],
                 text=best_text,
                 score=best_score,
                 reward=best_reward,
                 passed=solved,
-                sft_target=sft_target,   # str or None
+                sft_target=sft_target,  # str or None
             ),
             local_hints,
             int(solved),
@@ -274,6 +280,7 @@ async def _teacher_refine(
 # _sft_step  (replace the existing method on GRPOPipeline)
 # ---------------------------------------------------------------------------
 
+
 def _sft_step(self, *, refined: list[dict], train_model) -> float:
     """
     SFT on unsolved candidates that have a ground-truth sft_target.
@@ -282,10 +289,7 @@ def _sft_step(self, *, refined: list[dict], train_model) -> float:
     """
 
     # Only supervise on unsolved candidates that have a ref answer.
-    sft_candidates = [
-        r for r in refined
-        if not r["passed"] and r.get("sft_target")
-    ]
+    sft_candidates = [r for r in refined if not r["passed"] and r.get("sft_target")]
     if not sft_candidates:
         return 0.0
 
@@ -294,7 +298,7 @@ def _sft_step(self, *, refined: list[dict], train_model) -> float:
         batch_mask: Tensor,
         hidden_comp=None,
     ) -> Tensor:
-        mask    = batch_mask.to(batch_log_probs.device).float()
+        mask = batch_mask.to(batch_log_probs.device).float()
         lengths = mask.sum(dim=1).clamp(min=1.0)
         return (-((batch_log_probs * mask).sum(dim=1) / lengths)).mean()
 

@@ -1,11 +1,13 @@
 from __future__ import annotations
-import asyncio
-import tempfile
-import os
-from pathlib import Path
-from langchain_core.tools import tool
-from .schemas import VerifyResult
 
+import asyncio
+import os
+import tempfile
+from pathlib import Path
+
+from langchain_core.tools import tool
+
+from .schemas import VerifyResult
 
 DOCKER_IMAGE = os.getenv("COMPILE_DOCKER_IMAGE", "your-library-image")
 DOCKER_CONTAINER = os.getenv("COMPILE_DOCKER_CONTAINER", "")
@@ -37,7 +39,7 @@ async def compile_code(code: str, timeout: int = 30) -> VerifyResult:
         returncode, output = await _run(compile_cmd, timeout=timeout)
 
         warnings = [l for l in output.splitlines() if "warning:" in l.lower()]
-        errors   = [l for l in output.splitlines() if "error:"   in l.lower()]
+        errors = [l for l in output.splitlines() if "error:" in l.lower()]
 
         return VerifyResult(
             success=(returncode == 0),

@@ -1,5 +1,5 @@
-import os
 import gc
+import os
 import warnings
 
 import torch
@@ -13,7 +13,9 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-DEFAULT_GEMMA4_MODEL_PATH = "/media/blazingbhavneek/Common/Code/sglangServer/Infer/google/gemma-4-E2B-it"
+DEFAULT_GEMMA4_MODEL_PATH = (
+    "/media/blazingbhavneek/Common/Code/sglangServer/Infer/google/gemma-4-E2B-it"
+)
 DEFAULT_GEMMA4_LORA_TARGETS = [
     "q_proj",
     "k_proj",
@@ -25,7 +27,9 @@ DEFAULT_GEMMA4_LORA_TARGETS = [
 ]
 
 
-def _build_test_config(lora_targets: list[str], *, chunk_size: int, use_grad_checkpoint: bool) -> ModelConfig:
+def _build_test_config(
+    lora_targets: list[str], *, chunk_size: int, use_grad_checkpoint: bool
+) -> ModelConfig:
     return ModelConfig(
         lora=lora_targets,
         lora_fraction=0.25,
@@ -81,16 +85,9 @@ def run_greedy_generation_parity(
             hf_ids = torch.cat([hf_ids, hf_next], dim=1)
             hf_mask = torch.cat([hf_mask, torch.ones_like(hf_next)], dim=1)
 
-            prefix_hidden, pos_ids, shared_kv_states, per_layer_inputs = model._forward_prefix(
-                custom_ids,
-                custom_mask,
-            )
-            suffix_hidden = model._forward_suffix(
-                prefix_hidden,
-                pos_ids,
-                custom_mask,
-                shared_kv_states,
-                per_layer_inputs,
+            prefix_bundle = model._build_prefix_bundle(custom_ids, custom_mask)
+            suffix_hidden = model._run_suffix_from_prefix_bundle(
+                prefix_bundle, custom_mask
             )
             custom_logits = model._lm_head_logits_chunked(suffix_hidden)
             custom_next = custom_logits[:, -1, :].argmax(dim=-1, keepdim=True)

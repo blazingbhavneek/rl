@@ -1,6 +1,6 @@
 """Task-oriented dataset and curriculum package for RL training."""
 
-from .base import BaseVerifier, Problem, ProblemState, Score, BaseDataset
+from .base import BaseDataset, BaseVerifier, Problem, ProblemState, Score
 from .curriculum import BucketDistribution
 from .loader import CurriculumLoader
 from .stats import StatsWriter
@@ -13,5 +13,5 @@ __all__ = [
     "BucketDistribution",
     "CurriculumLoader",
     "StatsWriter",
-    "BaseDataset"
+    "BaseDataset",
 ]

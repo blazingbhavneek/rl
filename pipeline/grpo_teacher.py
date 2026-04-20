@@ -14,11 +14,12 @@ from tqdm.auto import tqdm
 from algo.grpo import GRPOAlgo
 from client.base import BaseClient
 from inference.vllm_engine import VLLMEngine
-from taskset.base import Problem, Score
 from taskset import BucketDistribution, CurriculumLoader
+from taskset.base import Problem, Score
 from taskset.codeforces import CodeforcesVerifier
 
 # region Model Profiles: For custom forward/backward implementations of selected models
+
 
 @dataclass(frozen=True)
 class _ModelProfile:
@@ -28,6 +29,7 @@ class _ModelProfile:
     tool_call_parser: str
     teacher_extra_body: dict
     gen_extra_payload: dict
+
 
 # TODO: check these, enable thinking for all
 
@@ -67,9 +69,11 @@ def _get_profile(model_type: str) -> _ModelProfile:
         )
     return _MODEL_PROFILES[model_type]
 
+
 # endregion Model Profiles
 
 # region Training config: For the training loop
+
 
 # TODO: add comments for each config point
 @dataclass
@@ -77,7 +81,9 @@ class TrainConfig:
     # --- model ---
     model_path: str
     model_type: str = "qwen3"  # "qwen3" | "qwen3_5" | "gptoss"
-    lora_targets: list[str] = field(default_factory=lambda: ["gate_proj", "up_proj", "down_proj"])
+    lora_targets: list[str] = field(
+        default_factory=lambda: ["gate_proj", "up_proj", "down_proj"]
+    )
     lora_fraction: float = 0.5
     lora_rank: int = 64
     lora_alpha: int = 128
@@ -139,9 +145,11 @@ class TrainConfig:
     verifier_timeout: float = 5.0
     verifier_workers: int = 16
 
+
 # endregion Training config
 
 # region Pipeline
+
 
 class GRPOPipeline:
     """
@@ -163,10 +171,10 @@ class GRPOPipeline:
     def __init__(self, config: TrainConfig) -> None:
 
         self.cfg = config
-        self.profile = _get_profile(config.model_type) # for custom model
-        
+        self.profile = _get_profile(config.model_type)  # for custom model
+
         self._prev_failed_rollouts: list[dict] = []
-        
+
         self._adapters_initialized = False
         self._lora_in_vllm = False  # True after first swap
 
@@ -179,9 +187,9 @@ class GRPOPipeline:
         profile = self.profile
 
         # region training model: the one which backprops
- 
-        from model.config import ModelConfig
+
         from algo import AlgoConfig
+        from model.config import ModelConfig
 
         model_cfg = ModelConfig(
             lora=cfg.lora_targets,
@@ -193,10 +201,12 @@ class GRPOPipeline:
             use_grad_checkpoint=cfg.use_grad_checkpoint,
         )
         ModelCls = getattr(importlib.import_module(profile.module), profile.cls_name)
-        train_model = ModelCls(cfg.model_path, model_cfg)
-        
+        train_model = self._build_train_model(ModelCls, model_cfg)
+
         # TODO: Setup variable LR for stability
-        trainable_params = [p for p in train_model.model.parameters() if p.requires_grad]
+        trainable_params = [
+            p for p in train_model.model.parameters() if p.requires_grad
+        ]
         optimizer = torch.optim.AdamW(trainable_params, lr=cfg.lr)
 
         # endregion
@@ -225,6 +235,7 @@ class GRPOPipeline:
         # -- teacher client --
         if teacher_client is None:
             from client.agent import AgentClient
+
             teacher_client = AgentClient(
                 base_url=cfg.engine_base_url,
                 api_key=cfg.engine_api_key,
@@ -239,23 +250,27 @@ class GRPOPipeline:
                 max_turns=cfg.teacher_max_turns,
                 extra_body=profile.teacher_extra_body,
             )
-        
+
         # endregion
 
         # region Algo, dataloader, bucket scheduler, verifier
 
         # TODO: Change for custom dataset
-        verifier = CodeforcesVerifier(timeout=cfg.verifier_timeout, n_workers=cfg.verifier_workers)
+        verifier = CodeforcesVerifier(
+            timeout=cfg.verifier_timeout, n_workers=cfg.verifier_workers
+        )
         verifier.check_dependencies()
 
         # -- GRPO algo --
-        algo = GRPOAlgo(AlgoConfig(
-            kl_coeff=cfg.kl_coeff,
-            clip_ratio_low=cfg.clip_ratio_low,
-            clip_ratio_high=cfg.clip_ratio_high,
-            norm_advantages=cfg.norm_advantages,
-            loss_agg="token_mean",
-        ))
+        algo = GRPOAlgo(
+            AlgoConfig(
+                kl_coeff=cfg.kl_coeff,
+                clip_ratio_low=cfg.clip_ratio_low,
+                clip_ratio_high=cfg.clip_ratio_high,
+                norm_advantages=cfg.norm_advantages,
+                loss_agg="token_mean",
+            )
+        )
 
         # -- curriculum --
         distribution = BucketDistribution(
@@ -279,7 +294,7 @@ class GRPOPipeline:
 
         # endregion
 
-        # region training loop 
+        # region training loop
 
         optimizer.zero_grad(set_to_none=True)
         step = 0
@@ -306,7 +321,9 @@ class GRPOPipeline:
                 problem_ids = list(stats.get("problem_ids", []))
                 problem_scores = list(stats.get("problem_scores", []))
                 if len(problem_ids) == len(problem_scores) and problem_ids:
-                    loader.update(problem_ids=problem_ids, scores=problem_scores, step=step)
+                    loader.update(
+                        problem_ids=problem_ids, scores=problem_scores, step=step
+                    )
 
                 # optimizer step
                 torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=cfg.grad_clip)
@@ -314,13 +331,19 @@ class GRPOPipeline:
                 optimizer.zero_grad(set_to_none=True)
 
                 # save + swap LoRA into vLLM
-                adapter_save_path = str(Path(cfg.run_dir) / "student_lora" / f"step_{step}")
+                adapter_save_path = str(
+                    Path(cfg.run_dir) / "student_lora" / f"step_{step}"
+                )
                 Path(adapter_save_path).mkdir(parents=True, exist_ok=True)
 
-                train_model.save_lora_adapter(cfg.student_adapter_name, adapter_save_path)
+                train_model.save_lora_adapter(
+                    cfg.student_adapter_name, adapter_save_path
+                )
                 print(f"[lora-save] ✓ saved → {adapter_save_path}")
 
-                await engine.swap_lora_adapter(cfg.student_adapter_name, adapter_save_path)
+                await engine.swap_lora_adapter(
+                    cfg.student_adapter_name, adapter_save_path
+                )
                 self._lora_in_vllm = True  # next step's rollouts will use it
                 print(f"[lora-swap] ✓ hot-swapped into vLLM (step={step})")
 
@@ -338,9 +361,8 @@ class GRPOPipeline:
         finally:
             step_bar.close()
             await self._engine_shutdown(engine)
-        
-        # endregion
 
+        # endregion
 
     # ------------------------------------------------------------------
     # Single batch
@@ -359,9 +381,9 @@ class GRPOPipeline:
         semaphore_limit: int = 32,
         refine_mode: str = "previous",
     ) -> dict:
-        
+
         # region Setup & Helpers: bind config/profile, ensure adapters, init accumulators, and define local helper funcs
-        
+
         cfg = self.cfg
         profile = self.profile
 
@@ -392,9 +414,9 @@ class GRPOPipeline:
             payload.update(profile.gen_extra_payload)
             async with sem:
                 resp = await engine._request_json("POST", "/chat/completions", payload)
-            msg = ((resp.get("choices") or [{}])[0].get("message") or {})
+            msg = (resp.get("choices") or [{}])[0].get("message") or {}
             return str(msg.get("content") or "").strip()
-        
+
         # TODO: Change the score function
         async def _score(problem: Problem, text: str) -> tuple[Score, float, bool]:
             sc = verifier(problem, text)
@@ -422,8 +444,16 @@ class GRPOPipeline:
             for (problem, messages, _), txt in zip(gen_tasks, results):
                 pbar.update(1)
                 sc, reward, passed = await _score(problem, txt)
-                current.append(dict(problem=problem, messages=messages, text=txt,
-                                    score=sc, reward=reward, passed=passed))
+                current.append(
+                    dict(
+                        problem=problem,
+                        messages=messages,
+                        text=txt,
+                        score=sc,
+                        reward=reward,
+                        passed=passed,
+                    )
+                )
 
         _log_rollout_stats("grpo-rollouts", current)
 
@@ -432,18 +462,24 @@ class GRPOPipeline:
         # region Phase 2 - Teacher Refinement: refine failed candidates (current/previous/none based on refine_mode)
 
         refine_candidates = {
-            "current":  [r for r in current if not r["passed"]],
+            "current": [r for r in current if not r["passed"]],
             "previous": self._prev_failed_rollouts,
-            "none":     [],
+            "none": [],
         }.get(refine_mode, [])
 
-        if teacher_client is not None and cfg.max_hint_attempts > 0 and refine_candidates:
+        if (
+            teacher_client is not None
+            and cfg.max_hint_attempts > 0
+            and refine_candidates
+        ):
             refined, hints_given, passed_after_hint = await self._teacher_refine(
                 refine_candidates, _generate, _score, teacher_client
             )
             _log_rollout_stats("teacher-fixes", refined, extra=f"hints={hints_given}")
             n_input = len(refine_candidates)
-            print(f"[teacher] fixed {passed_after_hint}/{n_input} ({100*passed_after_hint/n_input:.1f}%)")
+            print(
+                f"[teacher] fixed {passed_after_hint}/{n_input} ({100*passed_after_hint/n_input:.1f}%)"
+            )
 
         # endregion Phase 2 - Teacher Refinement: refine failed candidates (current/previous/none based on refine_mode)
 
@@ -457,22 +493,28 @@ class GRPOPipeline:
 
         device = next(train_model.model.parameters()).device
         actual_adapters = list(train_model.model.peft_config.keys())
-        active_name = cfg.student_adapter_name if cfg.student_adapter_name in actual_adapters else actual_adapters[0]
+        active_name = (
+            cfg.student_adapter_name
+            if cfg.student_adapter_name in actual_adapters
+            else actual_adapters[0]
+        )
         train_model.set_active_lora_adapter(active_name)
 
         for problem in tqdm(batch, desc="grpo-backprop", leave=False):
             rows = [r for r in current if r["problem"] is problem]
             if not rows:
                 continue
-            grpo_stats.append(self._grpo_step(
-                rows=rows,
-                algo=algo,
-                train_model=train_model,
-                tokenizer=tokenizer,
-                device=device,
-                n_problems=len(batch),
-                cfg=cfg,
-            ))
+            grpo_stats.append(
+                self._grpo_step(
+                    rows=rows,
+                    algo=algo,
+                    train_model=train_model,
+                    tokenizer=tokenizer,
+                    device=device,
+                    n_problems=len(batch),
+                    cfg=cfg,
+                )
+            )
         print(f"[grpo-backprop] completed={len(grpo_stats)}/{len(batch)}")
 
         sft_candidates = [r for r in refined if r["passed"]]
@@ -494,8 +536,15 @@ class GRPOPipeline:
 
         # endregion Bookkeeping & Return: cache failed rollouts for next batch and return summarized stats
 
-        return self._build_stats(batch, current, refined, grpo_stats,
-                                 hints_given, passed_after_hint, sft_loss)
+        return self._build_stats(
+            batch,
+            current,
+            refined,
+            grpo_stats,
+            hints_given,
+            passed_after_hint,
+            sft_loss,
+        )
 
     # ------------------------------------------------------------------
     # GRPO gradient step for one problem group
@@ -521,16 +570,21 @@ class GRPOPipeline:
 
         # Tokenize prompt once (chat template) and all sampled completions.
         prompt_text = tokenizer.apply_chat_template(
-            base_messages, tokenize=False, add_generation_prompt=True,
+            base_messages,
+            tokenize=False,
+            add_generation_prompt=True,
         )
         prompt_tok = tokenizer(prompt_text, return_tensors="pt")
         prompt_ids = prompt_tok["input_ids"].to(device, non_blocking=True)
         prompt_mask = prompt_tok["attention_mask"].to(device, non_blocking=True)
 
-        comp_tok = tokenizer(completions, return_tensors="pt",
-                             padding=True, add_special_tokens=False)
+        comp_tok = tokenizer(
+            completions, return_tensors="pt", padding=True, add_special_tokens=False
+        )
         completion_ids = comp_tok["input_ids"].to(device, non_blocking=True)
-        completion_mask = comp_tok["attention_mask"].to(device, dtype=torch.float32, non_blocking=True)
+        completion_mask = comp_tok["attention_mask"].to(
+            device, dtype=torch.float32, non_blocking=True
+        )
 
         # Broadcast a single prompt across G completions when needed.
         g = completion_ids.shape[0]
@@ -545,20 +599,26 @@ class GRPOPipeline:
 
         # Compute old policy log-probs in inference mode; these are GRPO baselines.
         with torch.inference_mode():
-            h_pre, pos = train_model._forward_prefix(full_ids, full_mask)
-            h_suf = train_model._forward_suffix(h_pre, pos, full_mask)
+            prefix_bundle = train_model._build_prefix_bundle(full_ids, full_mask)
+            h_suf = train_model._run_suffix_from_prefix_bundle(prefix_bundle, full_mask)
             h_comp = h_suf[:, -comp_len:, :]
-            old_lp = train_model._token_logprobs_chunked(h_comp, completion_ids).detach()
+            old_lp = train_model._token_logprobs_chunked(
+                h_comp, completion_ids
+            ).detach()
         algo.bind_old_logprobs(old_lp.cpu())
 
         # Optionally compute reference log-probs for KL if a ref adapter is configured.
         if cfg.ref_adapter_path and hasattr(algo, "bind_ref_logprobs"):
             train_model.set_active_lora_adapter(cfg.ref_adapter_name)
             with torch.inference_mode():
-                h_pre, pos = train_model._forward_prefix(full_ids, full_mask)
-                h_suf = train_model._forward_suffix(h_pre, pos, full_mask)
+                prefix_bundle = train_model._build_prefix_bundle(full_ids, full_mask)
+                h_suf = train_model._run_suffix_from_prefix_bundle(
+                    prefix_bundle, full_mask
+                )
                 h_comp = h_suf[:, -comp_len:, :]
-                ref_lp = train_model._token_logprobs_chunked(h_comp, completion_ids).detach()
+                ref_lp = train_model._token_logprobs_chunked(
+                    h_comp, completion_ids
+                ).detach()
             algo.bind_ref_logprobs(ref_lp.cpu())
             if cfg.student_adapter_path:
                 train_model.set_active_lora_adapter(cfg.student_adapter_name)
@@ -590,7 +650,7 @@ class GRPOPipeline:
 
     # TODO: SFT Loss is coming high in tests, find why
     def _sft_step(self, *, refined: list[dict], train_model) -> float:
-        
+
         # Batch SFT loss: token-level NLL averaged per sample, then across the batch.
         def _sft_loss_batch(
             batch_log_probs: Tensor,
@@ -633,7 +693,11 @@ class GRPOPipeline:
         # Limit concurrent teacher calls to avoid overloading the inference endpoint.
         cfg = self.cfg
         sem = asyncio.Semaphore(max(1, cfg.engine_semaphore_limit))
-        pbar = tqdm(total=len(candidates) * cfg.max_hint_attempts, desc="teacher-refine", leave=False)
+        pbar = tqdm(
+            total=len(candidates) * cfg.max_hint_attempts,
+            desc="teacher-refine",
+            leave=False,
+        )
 
         # Import once at function scope instead of per candidate/attempt.
         from client.agent import AgentClient
@@ -650,8 +714,12 @@ class GRPOPipeline:
 
             # Try up to max_hint_attempts; stop early once the candidate fully passes.
             for attempt_idx in range(cfg.max_hint_attempts):
-                _status = "did not compile" if not best_score.compiled else (
-                    f"compiled, passed {best_score.passed}/{best_score.total} tests"
+                _status = (
+                    "did not compile"
+                    if not best_score.compiled
+                    else (
+                        f"compiled, passed {best_score.passed}/{best_score.total} tests"
+                    )
                 )
                 _details = ""
                 if best_score.details:
@@ -701,23 +769,32 @@ class GRPOPipeline:
 
                 retry_messages = [
                     {"role": "system", "content": cfg.system_prompt},
-                    {"role": "user", "content": (
-                        f"{problem.statement}\n\n"
-                        "Your previous answer was incorrect.\n"
-                        f"Hint:\n{teacher_out}\n\n"
-                        "Try again with a corrected answer."
-                    )},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"{problem.statement}\n\n"
+                            "Your previous answer was incorrect.\n"
+                            f"Hint:\n{teacher_out}\n\n"
+                            "Try again with a corrected answer."
+                        ),
+                    },
                 ]
                 retry_txt = await generate_fn(retry_messages)
                 pbar.update(1)
 
                 # Re-score the retried answer and down-weight hint-assisted rewards.
-                retry_sc, retry_reward, retry_passed = await score_fn(problem, retry_txt)
+                retry_sc, retry_reward, retry_passed = await score_fn(
+                    problem, retry_txt
+                )
                 retry_reward *= cfg.hint_reward_discount
 
                 # Keep whichever attempt has the best reward so far.
                 if retry_reward > best_reward:
-                    best_text, best_score, best_reward = retry_txt, retry_sc, retry_reward
+                    best_text, best_score, best_reward = (
+                        retry_txt,
+                        retry_sc,
+                        retry_reward,
+                    )
 
                 # Early exit once fully solved; consume remaining progress-bar slots for this record.
                 if retry_passed:
@@ -727,17 +804,21 @@ class GRPOPipeline:
                     break
 
             # Return the best refined sample plus per-candidate hint/pass counters.
-            return dict(
-                problem=problem,
-                messages=[
-                    {"role": "system", "content": cfg.system_prompt},
-                    {"role": "user", "content": str(problem.statement)},
-                ],
-                text=best_text,
-                score=best_score,
-                reward=best_reward,
-                passed=solved,
-            ), local_hints, local_passed
+            return (
+                dict(
+                    problem=problem,
+                    messages=[
+                        {"role": "system", "content": cfg.system_prompt},
+                        {"role": "user", "content": str(problem.statement)},
+                    ],
+                    text=best_text,
+                    score=best_score,
+                    reward=best_reward,
+                    passed=solved,
+                ),
+                local_hints,
+                local_passed,
+            )
 
         # Run refinement for all candidates concurrently (bounded by semaphore inside each task).
         tasks = [_refine_one(rec) for rec in candidates]
@@ -759,6 +840,40 @@ class GRPOPipeline:
     # Helpers
     # ------------------------------------------------------------------
 
+    def _build_train_model(self, ModelCls, model_cfg):
+        cfg = self.cfg
+        adapter_path = None
+        if cfg.student_adapter_path:
+            candidate = Path(cfg.student_adapter_path).expanduser().resolve()
+            if candidate.exists():
+                adapter_path = str(candidate)
+            else:
+                print(
+                    f"[lora-init] student adapter path not found, starting fresh: {candidate}"
+                )
+
+        if adapter_path and ModelCls.__name__ == "Gemma4Model":
+            return ModelCls(
+                cfg.model_path,
+                model_cfg,
+                lora_path=adapter_path,
+                lora_adapter_name=cfg.student_adapter_name,
+                lora_is_trainable=True,
+            )
+
+        train_model = ModelCls(cfg.model_path, model_cfg)
+        if adapter_path:
+            train_model.load_lora_adapter(
+                cfg.student_adapter_name,
+                adapter_path,
+                is_trainable=True,
+            )
+            try:
+                train_model.set_active_lora_adapter(cfg.student_adapter_name)
+            except Exception:
+                pass
+        return train_model
+
     async def _ensure_adapters(self, engine, train_model, cfg: TrainConfig) -> None:
         """Run once on first call. Load initial adapter if provided."""
 
@@ -772,7 +887,9 @@ class GRPOPipeline:
             student_path = Path(cfg.student_adapter_path)
             if student_path.exists():
                 print(f"[lora-init] loading SFT checkpoint: {student_path}")
-                await engine.swap_lora_adapter(cfg.student_adapter_name, str(student_path))
+                await engine.swap_lora_adapter(
+                    cfg.student_adapter_name, str(student_path)
+                )
                 self._lora_in_vllm = True
                 print(f"[lora-init] ✓ loaded into vLLM")
             else:
@@ -785,12 +902,14 @@ class GRPOPipeline:
             ref_path = Path(cfg.ref_adapter_path)
             if not ref_path.exists():
                 raise FileNotFoundError(f"ref_adapter_path not found: {ref_path}")
-            train_model.load_lora_adapter(cfg.ref_adapter_name, str(ref_path), is_trainable=False)
+            train_model.load_lora_adapter(
+                cfg.ref_adapter_name, str(ref_path), is_trainable=False
+            )
             print(f"[lora-init] ✓ reference adapter loaded from {ref_path}")
 
     def _build_failed_cache(self, current: list[dict]) -> list[dict]:
         """Collect failed rollouts; attach best peer solution for next step's teacher."""
-        
+
         # Group rollouts by problem identity so peer hints are computed intra-problem.
         by_problem: dict[int, list[dict]] = {}
         for r in current:
@@ -800,13 +919,20 @@ class GRPOPipeline:
         cache: list[dict] = []
         for rows in by_problem.values():
             passed = [r for r in rows if r["passed"]]
-            peer = str(max(passed, key=lambda x: x["reward"])["text"]) if passed else None
+            peer = (
+                str(max(passed, key=lambda x: x["reward"])["text"]) if passed else None
+            )
             for r in rows:
                 if not r["passed"]:
-                    cache.append(dict(
-                        problem=r["problem"], text=r["text"],
-                        score=r["score"], reward=r["reward"], peer_solution=peer,
-                    ))
+                    cache.append(
+                        dict(
+                            problem=r["problem"],
+                            text=r["text"],
+                            score=r["score"],
+                            reward=r["reward"],
+                            peer_solution=peer,
+                        )
+                    )
 
         return cache
 
@@ -820,7 +946,7 @@ class GRPOPipeline:
         passed_after_hint: int,
         sft_loss: float,
     ) -> dict:
-        
+
         # Core counters for logging/monitoring at step granularity.
         out: dict = {
             "n_problems": float(len(batch)),
@@ -842,7 +968,9 @@ class GRPOPipeline:
         # Combined pass rate considers both original rollouts and teacher-refined outputs.
         all_entries = current + refined
         if all_entries:
-            out["combined_pass_rate"] = sum(1 for r in all_entries if r["passed"]) / len(all_entries)
+            out["combined_pass_rate"] = sum(
+                1 for r in all_entries if r["passed"]
+            ) / len(all_entries)
 
         # For per-problem reporting, keep the best rollout score from current rollouts.
         def _best_score(pid: str) -> Score:
@@ -851,8 +979,11 @@ class GRPOPipeline:
                 return Score(compiled=False, passed=0, total=0, error="no rollout")
             return max(
                 rows,
-                key=lambda r: float(r["score"].passed) / float(r["score"].total)
-                if r["score"].total > 0 else 0.0,
+                key=lambda r: (
+                    float(r["score"].passed) / float(r["score"].total)
+                    if r["score"].total > 0
+                    else 0.0
+                ),
             )["score"]
 
         # Preserve problem order from the sampled batch for downstream consumers.
@@ -898,11 +1029,16 @@ class GRPOPipeline:
 # Utility
 # ------------------------------------------------------------------
 
+
 def _log_rollout_stats(tag: str, rows: list[dict], extra: str = "") -> None:
     if not rows:
         return
     ratios = [
-        (float(r["score"].passed) / float(r["score"].total)) if r["score"].total > 0 else 0.0
+        (
+            (float(r["score"].passed) / float(r["score"].total))
+            if r["score"].total > 0
+            else 0.0
+        )
         for r in rows
     ]
     n_pass = sum(1 for r in rows if r["passed"])

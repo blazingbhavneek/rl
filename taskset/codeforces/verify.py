@@ -40,7 +40,9 @@ def _compile_code(code: str, tmp_dir: str) -> Tuple[bool, str, Optional[str]]:
     return True, "", str(exe)
 
 
-def _run_one_test(exe_path: str, test_case: Dict, timeout: float) -> Tuple[bool, str, float]:
+def _run_one_test(
+    exe_path: str, test_case: Dict, timeout: float
+) -> Tuple[bool, str, float]:
     try:
         rp = subprocess.run(
             [exe_path],
@@ -57,9 +59,15 @@ def _run_one_test(exe_path: str, test_case: Dict, timeout: float) -> Tuple[bool,
         return False, f"runtime error (exit {rp.returncode})", 0.0
 
     actual = "\n".join(l.rstrip() for l in rp.stdout.rstrip("\n").split("\n"))
-    expected = "\n".join(l.rstrip() for l in test_case.get("output", "").rstrip("\n").split("\n"))
+    expected = "\n".join(
+        l.rstrip() for l in test_case.get("output", "").rstrip("\n").split("\n")
+    )
     if actual != expected:
-        return False, f"wrong answer: expected '{expected[:120]}', got '{actual[:120]}'", 0.0
+        return (
+            False,
+            f"wrong answer: expected '{expected[:120]}', got '{actual[:120]}'",
+            0.0,
+        )
     return True, "", 0.0
 
 
@@ -118,7 +126,9 @@ class CodeforcesVerifier(BaseVerifier):
             except Exception:
                 global _FALLBACK_THREAD_EXECUTOR
                 if _FALLBACK_THREAD_EXECUTOR is None:
-                    _FALLBACK_THREAD_EXECUTOR = ThreadPoolExecutor(max_workers=self.n_workers)
+                    _FALLBACK_THREAD_EXECUTOR = ThreadPoolExecutor(
+                        max_workers=self.n_workers
+                    )
                 return _FALLBACK_THREAD_EXECUTOR
         return _GLOBAL_EXECUTOR
 
@@ -139,7 +149,9 @@ class CodeforcesVerifier(BaseVerifier):
     def verify_batch(self, problem: Problem, completions: List[str]) -> List[Score]:
         tcs = problem.metadata.get("test_cases", [])
         executor = self._executor()
-        futures = [executor.submit(_verify_worker, c, tcs, self.timeout) for c in completions]
+        futures = [
+            executor.submit(_verify_worker, c, tcs, self.timeout) for c in completions
+        ]
 
         results: List[Score] = []
         max_wait = self.timeout * max(len(tcs), 1) + 60.0
@@ -179,7 +191,9 @@ class CodeforcesVerifier(BaseVerifier):
         if subprocess.run(["which", "gcc"], capture_output=True).returncode != 0:
             errors.append("gcc not found")
 
-        gmp_src = "#include <gmp.h>\nint main(){mpz_t x;mpz_init(x);mpz_clear(x);return 0;}\n"
+        gmp_src = (
+            "#include <gmp.h>\nint main(){mpz_t x;mpz_init(x);mpz_clear(x);return 0;}\n"
+        )
         with tempfile.NamedTemporaryFile(suffix=".c", mode="w", delete=False) as f:
             f.write(gmp_src)
             fname = f.name

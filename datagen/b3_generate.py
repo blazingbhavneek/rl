@@ -1,20 +1,26 @@
 """
 b3: Only function name given. Agent must use ask_specialists for everything.
 """
+
 from __future__ import annotations
-import asyncio
+
 import argparse
+import asyncio
 import importlib
 import json
 import os
 from pathlib import Path
 
 from agents.master_agent import MasterAgent
-from agents.verify import verify_code, compile_code
+from agents.prompt_builder import (
+    build_b3_input,
+    extract_function_name,
+    load_raw_function,
+)
 from agents.prompts import b3_prompt
-from agents.prompt_builder import load_raw_function, extract_function_name, build_b3_input
 from agents.schemas import SFTPair
 from agents.utils import extract_code
+from agents.verify import compile_code, verify_code
 
 
 async def process_function(
@@ -73,11 +79,11 @@ async def process_function(
 
 async def main():
     parser = argparse.ArgumentParser(description="b3: Function name only")
-    parser.add_argument("--input-dir",       required=True)
-    parser.add_argument("--output-dir",      required=True)
-    parser.add_argument("--config",          required=True)
-    parser.add_argument("--mcp-tools-module",required=True)
-    parser.add_argument("--concurrency",     type=int, default=5)
+    parser.add_argument("--input-dir", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--mcp-tools-module", required=True)
+    parser.add_argument("--concurrency", type=int, default=5)
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -96,7 +102,9 @@ async def main():
     async def bounded(path):
         async with semaphore:
             try:
-                return await process_function(str(path), config, specialist_tools, args.output_dir)
+                return await process_function(
+                    str(path), config, specialist_tools, args.output_dir
+                )
             except Exception as e:
                 print(f"[b3] ERROR {path.name}: {e}")
                 return None
@@ -104,8 +112,8 @@ async def main():
     results = await asyncio.gather(*[bounded(p) for p in json_files])
 
     compiled = sum(1 for r in results if r and r.compiled)
-    failed   = sum(1 for r in results if r and not r.compiled)
-    errors   = sum(1 for r in results if r is None)
+    failed = sum(1 for r in results if r and not r.compiled)
+    errors = sum(1 for r in results if r is None)
     print(f"\nb3 SUMMARY: {compiled} compiled | {failed} failed | {errors} errors")
 
 

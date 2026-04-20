@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from torch import Tensor
 import torch
+from torch import Tensor
 
 
 def normalize_advantages(rewards: Tensor, eps: float = 1e-8) -> Tensor:
@@ -36,7 +36,9 @@ def top_k_kl_approx(
     q = teacher_logprobs_topk.float().exp().clamp(min=eps)
     p_sum = p.sum(dim=-1).clamp(max=1.0)
     q_sum = q.sum(dim=-1).clamp(max=1.0)
-    kl_topk = (p * (student_logprobs_topk.float() - teacher_logprobs_topk.float())).sum(dim=-1)
+    kl_topk = (p * (student_logprobs_topk.float() - teacher_logprobs_topk.float())).sum(
+        dim=-1
+    )
 
     tail_p = (1.0 - p_sum).clamp(min=eps)
     tail_q = (1.0 - q_sum).clamp(min=eps)
@@ -44,7 +46,9 @@ def top_k_kl_approx(
     return kl_topk + tail_kl
 
 
-def jensen_shannon_div(p_logits: Tensor, q_logits: Tensor, dim: int = -1, eps: float = 1e-8) -> Tensor:
+def jensen_shannon_div(
+    p_logits: Tensor, q_logits: Tensor, dim: int = -1, eps: float = 1e-8
+) -> Tensor:
     p_log = torch.log_softmax(p_logits.float(), dim=dim)
     q_log = torch.log_softmax(q_logits.float(), dim=dim)
     p = p_log.exp()
@@ -57,10 +61,13 @@ def jensen_shannon_div(p_logits: Tensor, q_logits: Tensor, dim: int = -1, eps: f
     return 0.5 * (kl_pm + kl_qm)
 
 
-def apply_ppo_clip(ratio: Tensor, advantage: Tensor, clip_low: float, clip_high: float) -> Tensor:
+def apply_ppo_clip(
+    ratio: Tensor, advantage: Tensor, clip_low: float, clip_high: float
+) -> Tensor:
     # Asymmetric clipping: tighter cap for positive-advantage updates.
     lower = 1.0 - float(clip_low)
     upper = 1.0 + float(clip_high)
     clipped = ratio.clamp(min=lower, max=upper)
-    return torch.where(advantage > 0, torch.minimum(ratio, clipped), torch.maximum(ratio, clipped))
-
+    return torch.where(
+        advantage > 0, torch.minimum(ratio, clipped), torch.maximum(ratio, clipped)
+    )

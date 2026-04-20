@@ -1,20 +1,27 @@
 """
 b1: Function name + param descriptions with correct order and types.
 """
+
 from __future__ import annotations
-import asyncio
+
 import argparse
+import asyncio
 import importlib
 import json
 import os
 from pathlib import Path
 
 from agents.master_agent import MasterAgent
-from agents.verify import verify_code, compile_code
+from agents.prompt_builder import (
+    build_b1_input,
+    extract_function_name,
+    extract_params,
+    load_raw_function,
+)
 from agents.prompts import b1_prompt
-from agents.prompt_builder import load_raw_function, extract_function_name, build_b1_input, extract_params
 from agents.schemas import SFTPair
 from agents.utils import extract_code
+from agents.verify import compile_code, verify_code
 
 
 async def process_function(
@@ -72,12 +79,14 @@ async def process_function(
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="b1: Params in correct order with types")
-    parser.add_argument("--input-dir",       required=True)
-    parser.add_argument("--output-dir",      required=True)
-    parser.add_argument("--config",          required=True)
-    parser.add_argument("--mcp-tools-module",required=True)
-    parser.add_argument("--concurrency",     type=int, default=5)
+    parser = argparse.ArgumentParser(
+        description="b1: Params in correct order with types"
+    )
+    parser.add_argument("--input-dir", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--mcp-tools-module", required=True)
+    parser.add_argument("--concurrency", type=int, default=5)
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -96,7 +105,9 @@ async def main():
     async def bounded(path):
         async with semaphore:
             try:
-                return await process_function(str(path), config, specialist_tools, args.output_dir)
+                return await process_function(
+                    str(path), config, specialist_tools, args.output_dir
+                )
             except Exception as e:
                 print(f"[b1] ERROR {path.name}: {e}")
                 return None
@@ -104,8 +115,8 @@ async def main():
     results = await asyncio.gather(*[bounded(p) for p in json_files])
 
     compiled = sum(1 for r in results if r and r.compiled)
-    failed   = sum(1 for r in results if r and not r.compiled)
-    errors   = sum(1 for r in results if r is None)
+    failed = sum(1 for r in results if r and not r.compiled)
+    errors = sum(1 for r in results if r is None)
     print(f"\nb1 SUMMARY: {compiled} compiled | {failed} failed | {errors} errors")
 
 

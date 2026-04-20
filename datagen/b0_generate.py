@@ -3,20 +3,26 @@ b0: Full function JSON given directly.
 Single MasterAgent with verify_code + ask_specialists.
 Generates SFT pairs: (detailed_prompt_with_full_json, compiling_code)
 """
+
 from __future__ import annotations
-import asyncio
+
 import argparse
+import asyncio
 import importlib
 import json
 import os
 from pathlib import Path
 
 from agents.master_agent import MasterAgent
-from agents.verify import verify_code, compile_code
+from agents.prompt_builder import (
+    build_b0_input,
+    extract_function_name,
+    load_raw_function,
+)
 from agents.prompts import b0_prompt
-from agents.prompt_builder import load_raw_function, extract_function_name, build_b0_input
 from agents.schemas import SFTPair
 from agents.utils import extract_code
+from agents.verify import compile_code, verify_code
 
 
 async def process_function(
@@ -71,11 +77,19 @@ async def process_function(
 
 async def main():
     parser = argparse.ArgumentParser(description="b0: Full function info given")
-    parser.add_argument("--input-dir",       required=True, help="Folder with per-function JSON files")
-    parser.add_argument("--output-dir",      required=True, help="Folder for SFT pair outputs")
-    parser.add_argument("--config",          required=True, help="JSON file with LLM config")
-    parser.add_argument("--mcp-tools-module",required=True, help="Python module path exposing tools list")
-    parser.add_argument("--concurrency",     type=int, default=5)
+    parser.add_argument(
+        "--input-dir", required=True, help="Folder with per-function JSON files"
+    )
+    parser.add_argument(
+        "--output-dir", required=True, help="Folder for SFT pair outputs"
+    )
+    parser.add_argument("--config", required=True, help="JSON file with LLM config")
+    parser.add_argument(
+        "--mcp-tools-module",
+        required=True,
+        help="Python module path exposing tools list",
+    )
+    parser.add_argument("--concurrency", type=int, default=5)
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -94,7 +108,9 @@ async def main():
     async def bounded(path):
         async with semaphore:
             try:
-                return await process_function(str(path), config, specialist_tools, args.output_dir)
+                return await process_function(
+                    str(path), config, specialist_tools, args.output_dir
+                )
             except Exception as e:
                 print(f"[b0] ERROR {path.name}: {e}")
                 return None
@@ -102,8 +118,8 @@ async def main():
     results = await asyncio.gather(*[bounded(p) for p in json_files])
 
     compiled = sum(1 for r in results if r and r.compiled)
-    failed   = sum(1 for r in results if r and not r.compiled)
-    errors   = sum(1 for r in results if r is None)
+    failed = sum(1 for r in results if r and not r.compiled)
+    errors = sum(1 for r in results if r is None)
     print(f"\n{'='*50}")
     print(f"b0 SUMMARY: {compiled} compiled | {failed} failed | {errors} errors")
     print(f"{'='*50}")

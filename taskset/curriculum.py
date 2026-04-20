@@ -93,7 +93,8 @@ class BucketDistribution:
     ) -> bool:
         lo, hi = window
         in_window = [
-            s for s in states
+            s
+            for s in states
             if lo <= s.bucket <= hi and not s.promoted and s.total_attempts > 0
         ]
         evaluated = len(in_window)
@@ -101,8 +102,10 @@ class BucketDistribution:
             return False
 
         mastered = [
-            s for s in in_window
-            if s.solve_rate >= threshold and s.consecutive_solves >= consecutive_required
+            s
+            for s in in_window
+            if s.solve_rate >= threshold
+            and s.consecutive_solves >= consecutive_required
         ]
         return (len(mastered) / evaluated) >= self.shift_success_ratio
 
@@ -181,7 +184,13 @@ if __name__ == "__main__":
     print("Mode bucket:", max(range(len(p1)), key=lambda i: p1[i]))
 
     fake_states = [
-        ProblemState(id=f"b1_{i}", bucket=1, total_attempts=4, solve_rate=0.9, consecutive_solves=2)
+        ProblemState(
+            id=f"b1_{i}",
+            bucket=1,
+            total_attempts=4,
+            solve_rate=0.9,
+            consecutive_solves=2,
+        )
         for i in range(20)
     ]
     print(

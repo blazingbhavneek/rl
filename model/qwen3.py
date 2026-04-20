@@ -12,6 +12,7 @@ from .base import BaseModel
 
 # endregion
 
+
 # TODO: REMOVE CPU Overhead
 # _forward_suffix using torch.all
 # using linear attn mask
@@ -96,7 +97,9 @@ class Qwen3Model(BaseModel):
         )
         if hasattr(inner_candidate, "language_model"):
             inner_candidate = inner_candidate.language_model
-        if hasattr(inner_candidate, "model") and hasattr(inner_candidate.model, "layers"):
+        if hasattr(inner_candidate, "model") and hasattr(
+            inner_candidate.model, "layers"
+        ):
             inner_candidate = inner_candidate.model
 
         self._inner_model = inner_candidate
@@ -112,7 +115,8 @@ class Qwen3Model(BaseModel):
 
         self._layer_types = list(getattr(self._inner_model.config, "layer_types", []))
         self._suffix_layer_types = {
-            self._prefix_split_layer + i: (
+            self._prefix_split_layer
+            + i: (
                 self._layer_types[self._prefix_split_layer + i]
                 if (self._prefix_split_layer + i) < len(self._layer_types)
                 else "full_attention"
@@ -120,7 +124,9 @@ class Qwen3Model(BaseModel):
             for i in range(len(self._suffix_layers))
         }
         self._prefix_layer_types = {
-            i: (self._layer_types[i] if i < len(self._layer_types) else "full_attention")
+            i: (
+                self._layer_types[i] if i < len(self._layer_types) else "full_attention"
+            )
             for i in range(len(self._prefix_layers))
         }
 
@@ -147,7 +153,11 @@ class Qwen3Model(BaseModel):
                 layer_type = (
                     layer_types[i] if i < len(layer_types) else "full_attention"
                 )
-                layer_mask = linear_attn_mask if layer_type == "linear_attention" else causal_mask
+                layer_mask = (
+                    linear_attn_mask
+                    if layer_type == "linear_attention"
+                    else causal_mask
+                )
                 out = layer(
                     hidden_states,
                     attention_mask=layer_mask,
@@ -261,7 +271,9 @@ class Qwen3Model(BaseModel):
             .unsqueeze(0)
             .expand(batch_size, seq_len)
         )
-        cache_position = torch.arange(seq_len, device=input_ids.device, dtype=torch.long)
+        cache_position = torch.arange(
+            seq_len, device=input_ids.device, dtype=torch.long
+        )
         try:
             causal_mask = create_causal_mask(
                 config=self._inner_model.config,
@@ -352,7 +364,9 @@ class Qwen3Model(BaseModel):
         for i, layer in enumerate(self._suffix_layers):
             abs_idx = self._prefix_split_layer + i
             layer_type = self._suffix_layer_types.get(abs_idx, "full_attention")
-            layer_mask = linear_attn_mask if layer_type == "linear_attention" else causal_mask
+            layer_mask = (
+                linear_attn_mask if layer_type == "linear_attention" else causal_mask
+            )
 
             if self._use_grad_checkpoint and torch.is_grad_enabled():
                 if layer_mask is None:

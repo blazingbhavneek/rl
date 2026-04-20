@@ -1,11 +1,12 @@
 from __future__ import annotations
+
 import re
 from typing import Optional
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, AIMessage
+
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool as LangChainTool
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
-
 
 RunOutput = tuple[str, any]
 
@@ -43,7 +44,9 @@ class AgentClient:
             self.system_prompt = system_prompt
         self.message_history = [SystemMessage(content=self.system_prompt)]
 
-    async def run(self, prompt: str, output_model: Optional[type[BaseModel]] = None) -> RunOutput:
+    async def run(
+        self, prompt: str, output_model: Optional[type[BaseModel]] = None
+    ) -> RunOutput:
         if not prompt or not prompt.strip():
             raise ValueError("prompt must be a non-empty string")
 

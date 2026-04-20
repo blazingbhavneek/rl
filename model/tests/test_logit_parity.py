@@ -13,7 +13,9 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-DEFAULT_GEMMA4_MODEL_PATH = "/media/blazingbhavneek/Common/Code/sglangServer/Infer/google/gemma-4-E2B-it"
+DEFAULT_GEMMA4_MODEL_PATH = (
+    "/media/blazingbhavneek/Common/Code/sglangServer/Infer/google/gemma-4-E2B-it"
+)
 DEFAULT_GEMMA4_LORA_TARGETS = [
     "q_proj",
     "k_proj",
@@ -25,7 +27,9 @@ DEFAULT_GEMMA4_LORA_TARGETS = [
 ]
 
 
-def _build_test_config(lora_targets: list[str], *, chunk_size: int, use_grad_checkpoint: bool) -> ModelConfig:
+def _build_test_config(
+    lora_targets: list[str], *, chunk_size: int, use_grad_checkpoint: bool
+) -> ModelConfig:
     return ModelConfig(
         lora=lora_targets,
         lora_fraction=0.25,
@@ -37,9 +41,7 @@ def _build_test_config(lora_targets: list[str], *, chunk_size: int, use_grad_che
     )
 
 
-def run_logit_parity(
-    model_path: str, model_cls: type, lora_targets: list[str]
-) -> None:
+def run_logit_parity(model_path: str, model_cls: type, lora_targets: list[str]) -> None:
     t0 = time.perf_counter()
 
     print("[parity] building config")
@@ -104,7 +106,9 @@ def run_logit_parity(
             output[0] if isinstance(output, tuple) else output
         ).detach()
 
-    hook = custom_model._layers[layer_idx].register_forward_hook(_capture_boundary_output)
+    hook = custom_model._layers[layer_idx].register_forward_hook(
+        _capture_boundary_output
+    )
 
     print("[parity] running HF-style forward on loaded model")
     t_hf = time.perf_counter()
@@ -118,9 +122,8 @@ def run_logit_parity(
     print(f"[parity] hf-style forward done in {time.perf_counter() - t_hf:.2f}s")
 
     with torch.inference_mode():
-        custom_prefix_hidden, _, _, _, _, _ = custom_model._forward_prefix(
-            input_ids, attention_mask
-        )
+        prefix_bundle = custom_model._build_prefix_bundle(input_ids, attention_mask)
+        custom_prefix_hidden = prefix_bundle.hidden_prefix
 
     if "hidden" in hook_cache:
         hf_boundary_hidden = hook_cache["hidden"]

@@ -5,32 +5,33 @@ import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from sft_primer.train import (
-    detect_model_family,
-    train_model_on_qa_pairs,
-)
+from sft_primer.train import detect_model_family, train_model_on_qa_pairs
 
 # ---------------------------------------------------------------------------
 # Config — edit these before running
 # ---------------------------------------------------------------------------
 
-INPUT_FOLDER_PATH      = Path("/media/blazingbhavneek/Common/Code/rl/sft_primer/input/intel")
-MODEL_PATH             = "/media/blazingbhavneek/Common/Code/sglangServer/Infer/google/gemma-4-E2B-it"
+INPUT_FOLDER_PATH = Path("/media/blazingbhavneek/Common/Code/rl/sft_primer/input/intel")
+MODEL_PATH = (
+    "/media/blazingbhavneek/Common/Code/sglangServer/Infer/google/gemma-4-E2B-it"
+)
 
-TRAIN_EPOCHS           = 5
-TRAIN_LR               = 2e-4
-TRAIN_BATCH_SIZE       = 4
-GRAD_ACCUM_STEPS       = 4
-TRAIN_CHUNK_SIZE       = 256
-TRAIN_LOGPROB_CHUNK    = 128
+TRAIN_EPOCHS = 5
+TRAIN_LR = 2e-4
+TRAIN_BATCH_SIZE = 4
+GRAD_ACCUM_STEPS = 4
+TRAIN_CHUNK_SIZE = 256
+TRAIN_LOGPROB_CHUNK = 128
 TRAIN_TOKEN_CHUNK_SIZE = 128
-OFFLOAD_PREFIX_TO_CPU  = False
-MAX_SAMPLE_TOKENS      = 2048
-TRAIN_ON_REASONING     = True
-INFER_MAX_NEW_TOKENS   = 8192
+OFFLOAD_PREFIX_TO_CPU = False
+MAX_SAMPLE_TOKENS = 2048
+TRAIN_ON_REASONING = True
+INFER_MAX_NEW_TOKENS = 8192
 GPU_MEMORY_UTILIZATION = 0.90
-SAVE_EVERY_STEPS       = 50           # save LoRA every N optimizer steps; 0 = disabled
-QA_PAIRS_PATH          = Path("/media/blazingbhavneek/Common/Code/rl/sft_primer/output/intel/qa_pair.jsonl")
+SAVE_EVERY_STEPS = 50  # save LoRA every N optimizer steps; 0 = disabled
+QA_PAIRS_PATH = Path(
+    "/media/blazingbhavneek/Common/Code/rl/sft_primer/output/intel/qa_pair.jsonl"
+)
 
 # ---------------------------------------------------------------------------
 # Hardcoded QA sample — used to sanity-check the pipeline without chunking.
@@ -71,6 +72,7 @@ LLVM_QA_SAMPLE = {
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _load_qa_pairs(path: Path) -> list[dict]:
     pairs = []
     with path.open("r", encoding="utf-8") as f:
@@ -83,7 +85,11 @@ def _load_qa_pairs(path: Path) -> list[dict]:
             except json.JSONDecodeError:
                 continue
             if isinstance(row, dict):
-                if "messages" in row and isinstance(row["messages"], list) and len(row["messages"]) >= 2:
+                if (
+                    "messages" in row
+                    and isinstance(row["messages"], list)
+                    and len(row["messages"]) >= 2
+                ):
                     pairs.append(row)
                 elif (
                     str(row.get("question", "")).strip()
@@ -107,7 +113,9 @@ def _infer(model, tokenizer, question: str, model_family: str) -> str:
         )
     except TypeError:
         prompt = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
         )
 
     tok = tokenizer([prompt], return_tensors="pt")
@@ -122,7 +130,9 @@ def _infer(model, tokenizer, question: str, model_family: str) -> str:
             max_new_tokens=INFER_MAX_NEW_TOKENS,
             do_sample=False,
         )
-    return tokenizer.decode(out[0, input_ids.shape[1]:], skip_special_tokens=True).strip()
+    return tokenizer.decode(
+        out[0, input_ids.shape[1] :], skip_special_tokens=True
+    ).strip()
 
 
 def _compare_base_vs_lora(adapter_dir: str) -> None:
@@ -139,7 +149,9 @@ def _compare_base_vs_lora(adapter_dir: str) -> None:
     base_model.eval()
 
     print("--- base model answer ---")
-    base_answer = _infer(base_model, tokenizer, LLVM_QA_SAMPLE["question"], model_family)
+    base_answer = _infer(
+        base_model, tokenizer, LLVM_QA_SAMPLE["question"], model_family
+    )
     print(base_answer)
 
     print("\nloading_lora_adapter...")
@@ -147,7 +159,9 @@ def _compare_base_vs_lora(adapter_dir: str) -> None:
     lora_model.eval()
 
     print("--- lora model answer ---")
-    lora_answer = _infer(lora_model, tokenizer, LLVM_QA_SAMPLE["question"], model_family)
+    lora_answer = _infer(
+        lora_model, tokenizer, LLVM_QA_SAMPLE["question"], model_family
+    )
     print(lora_answer)
 
     print("\n--- question ---")
@@ -159,6 +173,7 @@ def _compare_base_vs_lora(adapter_dir: str) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def _run() -> None:
     output_root = str(INPUT_FOLDER_PATH.parent.parent / "output")
@@ -187,8 +202,7 @@ def _run() -> None:
 
     # --- check if final LoRA already exists; if so, skip training and compare ---
     model_key = (
-        MODEL_PATH.strip("/")
-        .replace("\\", "_").replace("/", "_").replace(":", "_")
+        MODEL_PATH.strip("/").replace("\\", "_").replace("/", "_").replace(":", "_")
     )
     final_lora_dir = Path(output_root) / input_folder / "lora" / model_key / "final"
     if final_lora_dir.exists():
@@ -197,7 +211,11 @@ def _run() -> None:
         _compare_base_vs_lora(str(final_lora_dir))
         return
 
-    qa_pairs = _load_qa_pairs(QA_PAIRS_PATH) if QA_PAIRS_PATH.exists() and QA_PAIRS_PATH.stat().st_size > 0 else []
+    qa_pairs = (
+        _load_qa_pairs(QA_PAIRS_PATH)
+        if QA_PAIRS_PATH.exists() and QA_PAIRS_PATH.stat().st_size > 0
+        else []
+    )
     if not qa_pairs:
         raise ValueError(f"No QA pairs found at {QA_PAIRS_PATH}")
 
@@ -206,7 +224,9 @@ def _run() -> None:
     print(f"qa_pairs_count: {len(qa_pairs)} (includes 1 hardcoded LLVM sample)")
 
     # --- training ---
-    print(f"starting_lora_training: epochs={TRAIN_EPOCHS} train_on_reasoning={TRAIN_ON_REASONING}")
+    print(
+        f"starting_lora_training: epochs={TRAIN_EPOCHS} train_on_reasoning={TRAIN_ON_REASONING}"
+    )
     adapter_dir = train_model_on_qa_pairs(
         qa_pairs=qa_pairs,
         train_model_path=MODEL_PATH,
