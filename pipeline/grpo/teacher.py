@@ -13,7 +13,12 @@ from tqdm.auto import tqdm
 from client.agent import AgentClient
 from client.tools import build_markdown_rag_tool
 
-from .utils import COT_SYSTEM_PROMPT, _sample_ref_answer, write_generation_log
+from .utils import (
+    COT_SYSTEM_PROMPT,
+    _as_c_block,
+    _sample_ref_answer,
+    write_generation_log,
+)
 
 TEACHER_SYSTEM_PROMPT = (
     "You are a coding tutor helping a student fix their C code. "
@@ -33,6 +38,8 @@ TEACHER_SYSTEM_PROMPT = (
 async def init_teacher_client(pipeline, teacher_client):
     if teacher_client is not None:
         return teacher_client
+    if not pipeline.cfg.enable_teacher:
+        return None
 
     cfg = pipeline.cfg
     profile = pipeline.profile
@@ -180,15 +187,16 @@ async def teacher_refine(
                 },
             ]
 
-            retry_text = await generate_fn(retry_messages)
+            retry_out = await generate_fn(retry_messages)
             pbar.update(1)
 
-            if retry_text is None:
+            if retry_out is None:
                 tqdm.write(
                     f"[teacher-refine] generation failed on attempt {attempt + 1}, skipping"
                 )
                 continue
 
+            retry_text, retry_reasoning, retry_content = retry_out
             retry_sc, retry_reward, retry_passed = await score_fn(problem, retry_text)
             write_generation_log(
                 pipeline,
@@ -201,6 +209,8 @@ async def teacher_refine(
                 messages=retry_messages,
                 output=retry_text,
                 score=retry_sc,
+                reasoning=retry_reasoning,
+                content=retry_content,
             )
 
             retry_reward *= cfg.hint_reward_discount
@@ -230,19 +240,6 @@ async def teacher_refine(
         # --- SFT targets ---
         sft_target: Optional[str] = None
         sft_direct_reasoning: Optional[str] = None
-
-        def _strip_think(text: str) -> str:
-            return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL).strip()
-
-        def _as_c_block(text: Optional[str]) -> Optional[str]:
-            if not text:
-                return None
-            text = _strip_think(text)
-            m = re.search(r"```c\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
-            code = m.group(1).strip() if m else text.strip()
-            if not code:
-                return None
-            return f"```c\n{code}\n```"
 
         if solved:
             if ref_answer:
@@ -279,7 +276,7 @@ async def teacher_refine(
         # hint-context pair: the student saw (problem + prev attempt + hint)
         # and produced best_hint_text. We train on that full context -> answer.
         sft_hint_completion = _fmt_completion(
-            _strip_think(best_hint_text) if best_hint_text else None, None
+            _as_c_block(best_hint_text) if best_hint_text else None, None
         )
         sft_direct_completion = _fmt_completion(sft_target, sft_direct_reasoning)
 

@@ -1,5 +1,7 @@
+import asyncio
 import json
 import random
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from itertools import count
@@ -11,7 +13,84 @@ from tree_sitter import Language, Parser
 from tree_sitter_c import language as c_language
 
 
-# TODO: Move this to util
+def _build_prompt_text(tokenizer, messages: list[dict]) -> str:
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+
+async def _generate(
+    messages: list[dict],
+    *,
+    engine,
+    sem: asyncio.Semaphore,
+    use_lora: bool,
+    active_adapter: str,
+    model_path: str,
+    temperature: float,
+    max_tokens: int,
+    gen_extra_payload: dict,
+) -> Optional[tuple[str, str, str]]:
+    model_name = active_adapter if use_lora else model_path
+    payload = {
+        "model": model_name,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
+    payload.update(gen_extra_payload)
+    async with sem:
+        resp = await engine._request_json("POST", "/chat/completions", payload)
+    choices = resp.get("choices") or []
+    if not choices:
+        return None
+    raw_msg = choices[0].get("message") or {}
+    reasoning = str(raw_msg.get("reasoning") or "").strip()
+    content = str(raw_msg.get("content") or "").strip()
+    if reasoning:
+        text = f"<|channel|>thought\n{reasoning}\n<channel|>\n{content}"
+    else:
+        text = f"{content}<turn|>"
+    return text, reasoning, content
+
+
+def _is_clean_logs(compile_logs: str, stdout: str = "") -> bool:
+    combined = f"{compile_logs or ''} {stdout or ''}".lower()
+    if not combined.strip():
+        return True
+    return not any(
+        kw in combined
+        for kw in [
+            "warning:",
+            "error:",
+            "note:",
+            "implicit",
+            "addresssanitizer",
+            "undefined behavior",
+            "segmentation fault",
+            "segfault",
+            "abort",
+        ]
+    )
+
+
+def _strip_think(text: str) -> str:
+    return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL).strip()
+
+
+def _as_c_block(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    text = _strip_think(text)
+    m = re.search(r"```c\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    code = m.group(1).strip() if m else text.strip()
+    if not code:
+        return None
+    return f"```c\n{code}\n```"
+
 def _log_rollout_stats(tag: str, rows: list[dict], extra: str = "") -> None:
     if not rows:
         return
@@ -45,6 +124,8 @@ def write_generation_log(
     score=None,
     finish_reason: Optional[str] = None,
     error: Optional[str] = None,
+    reasoning: Optional[str] = None,
+    content: Optional[str] = None,
 ) -> None:
     log_dir = Path("gen_logs") / f"step_{step}"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -66,25 +147,24 @@ def write_generation_log(
         for i, m in enumerate(messages, 1):
             role = m.get("role", "unknown")
             f.write(f"### {i}. {role}\n\n")
-            content = m.get("content", "")
-            if isinstance(content, str):
-                f.write(f"{content}\n\n")
+            msg_content = m.get("content", "")
+            if isinstance(msg_content, str):
+                f.write(f"{msg_content}\n\n")
             else:
                 f.write("```json\n")
-                f.write(json.dumps(content, ensure_ascii=False, indent=2))
+                f.write(json.dumps(msg_content, ensure_ascii=False, indent=2))
                 f.write("\n```\n\n")
 
         f.write("## Full Prompt\n\n")
-        prompt_text = pipeline._build_prompt_text(messages)
+        prompt_text = _build_prompt_text(pipeline.tokenizer, messages)
         f.write(f"```text\n{prompt_text}\n```\n\n")
 
         f.write("## Response\n\n")
         if output is not None:
-            reasoning, content = pipeline._split_reasoning_and_content(output)
             f.write("### Reasoning\n\n")
-            f.write(f"```text\n{reasoning}\n```\n\n")
+            f.write(f"```text\n{reasoning or ''}\n```\n\n")
             f.write("### Content\n\n")
-            f.write(f"```text\n{content}\n```\n\n")
+            f.write(f"```text\n{content or output}\n```\n\n")
         else:
             f.write("_No output returned._\n")
 

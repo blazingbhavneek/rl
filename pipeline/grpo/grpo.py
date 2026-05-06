@@ -8,7 +8,6 @@ import importlib
 import json
 import os
 import random
-import re
 import shutil
 
 # 3rd party
@@ -17,7 +16,7 @@ from collections import Counter
 from itertools import count
 from pathlib import Path
 from pprint import pprint
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
 from tqdm.auto import tqdm
@@ -29,14 +28,18 @@ from client.base import BaseClient
 from inference import VLLMEngine
 from model.config import ModelConfig
 from taskset import BucketDistribution, CurriculumLoader
-from taskset.base import Problem, Score
+from taskset.base import Problem
 from taskset.moove.verify import RemoteDockerVerifier
 
 from .config import TrainConfig
 from .teacher import build_failed_cache, init_teacher_client, sft_step, teacher_refine
 from .utils import (
     FunctionCallAnalyzer,
+    _as_c_block,
+    _build_prompt_text,
+    _generate as _vllm_generate,
     _get_profile,
+    _is_clean_logs,
     _log_rollout_stats,
     write_generation_log,
 )
@@ -55,6 +58,9 @@ class GRPOPipeline:
         # Configs
         self.cfg = config
         self.profile = _get_profile(config.model_type)
+        self.tokenizer = None
+        self.train_model = None
+        self.verifier = None
 
         # For teacher, we need to keep track of previous failed rollouts so they can be SFT'ed next time
         self._prev_failed_rollouts: list[dict] = []
@@ -66,137 +72,9 @@ class GRPOPipeline:
 
         # logs and counters
         self._gen_log_counter = count()
-        self._task_stats: dict[str, dict] = {}
-
-        stats_path = Path(config.run_dir) / "task_stats.json"
-        if stats_path.exists():
-            try:
-                with stats_path.open() as f:
-                    self._task_stats = json.load(f)
-                tqdm.write(
-                    f"[resume] loaded task_stats with {len(self._task_stats)} entries"
-                )
-            except Exception:
-                pass
 
         # the vllm engine
         self.engine = None  # Will be set in train()
-
-    # TODO: clean it up
-    def _build_prompt_text(self, messages: list[dict]) -> str:
-        """Helper to reconstruct the prompt text from messages."""
-        return self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
-    # Before vLLM had proper support gemma lora, we had to temperarily roll back to HF generation, so new helper
-    # functions were introduced to cover for raw token outputs by hf
-    # TODO: clean up
-    # region HF gen specific functions
-    def _split_reasoning_and_content(self, text: str) -> tuple[str, str]:
-        """
-        Splits Gemma model output into reasoning and content.
-        Strips all <eos> and <turn|> special tokens from content.
-        Returns: (reasoning, content)
-        """
-        text = text.strip()
-
-        # Defensive: trim any junk before the Gemma reasoning marker
-        for marker in ("<|channel|>thought",):
-            if marker in text:
-                text = text[text.index(marker) :]
-                break
-
-        # Gemma4 format:
-        #   <|channel|>thought\n ... \n<channel|>\n(content)
-        match = re.search(
-            r"<\|channel\|>thought\n(.*?)<channel\|>\n?(.*)",
-            text,
-            re.DOTALL,
-        )
-        if match:
-            reasoning = match.group(1).strip()
-            content = match.group(2).strip()
-            # Remove ALL special tokens from content
-            content = content.replace("<eos>", "").replace("<turn|>", "").strip()
-            return reasoning, content
-
-        # Fallback: Gemma emitted no reasoning block
-        if "<|channel|>" in text:
-            tqdm.write("[warning] Gemma reasoning marker present but parsing failed")
-
-        # Clean fallback content too - remove all special tokens
-        content = text.replace("<eos>", "").replace("<turn|>", "").strip()
-        return "", content
-
-        # THIS helper function was part of run_batch method, moved here for cleanliness
-        # async def _batch_generate_hf(
-        #     batch_problems: list[Problem], n_rollouts: int
-        # ) -> list[dict]:
-        #     """Direct HF batched generation with reasoning extraction."""
-        #     model_family = cfg.model_type
-        #     # 1. Build prompts
-        #     prompts = []
-        #     problem_map = []
-        #     for prob in batch_problems:
-        #         messages = [
-        #             {"role": "system", "content": "You are a helpful assistant. <|think|>"},
-        #             {"role": "user", "content": str(prob.statement)},
-        #         ]
-        #         prompt_text = train_model.tokenizer.apply_chat_template(
-        #             messages, tokenize=False, add_generation_prompt=True
-        #         )
-        #         for _ in range(n_rollouts):
-        #             prompts.append(prompt_text)
-        #             problem_map.append(prob)
-        #     # 2. Chunked generation (avoids OOM)
-        #     chunk_size = getattr(cfg, "gen_batch_size", 8)
-        #     all_decoded = []
-        #     device = next(train_model.model.parameters()).device
-        #     for i in range(0, len(prompts), chunk_size):
-        #         chunk_prompts = prompts[i : i + chunk_size]
-        #         batch = train_model.tokenizer(
-        #             chunk_prompts, return_tensors="pt", padding=True
-        #         ).to(device)
-        #         with torch.inference_mode():
-        #             output_ids = train_model.model.generate(
-        #                 input_ids=batch["input_ids"],
-        #                 attention_mask=batch["attention_mask"],
-        #                 max_new_tokens=2048,
-        #                 do_sample=True,
-        #                 temperature=cfg.temperature,
-        #                 pad_token_id=train_model.tokenizer.pad_token_id
-        #                     or train_model.tokenizer.eos_token_id,
-        #                 eos_token_id=train_model.tokenizer.eos_token_id,
-        #             )
-        #         for idx, (prompt, out_ids) in enumerate(zip(chunk_prompts, output_ids)):
-        #             prompt_len = batch["attention_mask"][idx].sum().item()
-        #             new_text = train_model.tokenizer.decode(
-        #                 out_ids[prompt_len:], skip_special_tokens=False
-        #             )
-        #             all_decoded.append(new_text.strip())
-        #         torch.cuda.empty_cache()  # CRITICAL for stable multi-step training
-        #     # 3. Parse reasoning + answer, store canonically
-        #     results = []
-        #     for full_output, prob in zip(all_decoded, problem_map):
-        #         reasoning, answer = self._split_reasoning_and_content(full_output)
-        #         results.append(
-        #             {
-        #                 "problem": prob,
-        #                 "messages": [
-        #                     {"role": "system", "content": "You are a helpful assistant. <|think|>"},
-        #                     {"role": "user", "content": str(prob.statement)},
-        #                 ],
-        #                 "raw_completion": full_output,
-        #                 "reasoning": reasoning,
-        #                 "answer": answer,
-        #             }
-        #         )
-        #     return results
-
-    # endregion HF gen specific functions
 
     # Training loop
 
@@ -226,6 +104,7 @@ class GRPOPipeline:
         )
 
         self.tokenizer = train_model.tokenizer
+        self.train_model = train_model
         trainable_params = [
             p for p in train_model.model.parameters() if p.requires_grad
         ]
@@ -304,9 +183,31 @@ class GRPOPipeline:
                 tqdm.write(
                     f"[resume] SFT primer detected (no meta.json) – starting fresh "
                     f"from step 0: {adapter_path.name}"
-                )
+        )
 
         optimizer.zero_grad(set_to_none=True)
+
+        def _write_checkpoint_state(save_dir: Path, step: int) -> None:
+            with (save_dir / "meta.json").open("w") as f:
+                json.dump(
+                    {"step": step, "adapter_name": cfg.student_adapter_name},
+                    f,
+                )
+            torch.save(optimizer.state_dict(), save_dir / "optimizer.pt")
+            torch.save(sft_optimizer.state_dict(), save_dir / "sft_optimizer.pt")
+            torch.save(loader.state_dict(), save_dir / "curriculum.pt")
+            torch.save(
+                {
+                    "python": random.getstate(),
+                    "torch": torch.random.get_rng_state(),
+                    "cuda": (
+                        torch.cuda.get_rng_state_all()
+                        if torch.cuda.is_available()
+                        else None
+                    ),
+                },
+                save_dir / "rng.pt",
+            )
 
         # TODO: Needs to be cleaned up, many hardcodings
         # --- vLLM engine ---
@@ -339,6 +240,7 @@ class GRPOPipeline:
         # Verifier for code
         verifier = RemoteDockerVerifier(timeout=cfg.verifier_timeout)
         verifier.check_dependencies()
+        self.verifier = verifier.verify
 
         # Algorithm
         # TODO: Current pipeline is very coupled with algo, need to make it decoupled a lil bit for slightly diff variants of grpo
@@ -368,21 +270,14 @@ class GRPOPipeline:
                 if not batch:
                     break
 
-                # TODO: Bring this back for teacher refinement,
-                # A non empty refined means some responses were corrected by teacher model
-                # current, refined, _, _ = await self.run_batch(
                 gen_start = time.time()
 
                 # Generation step for this batch of problems
                 # TODO: unnecessary dep injection
-                current, _, _, _ = await self.run_batch(
+                current, refined, _, _ = await self.run_batch(
                     batch=batch,
                     step=step,
-                    train_model=train_model,
-                    tokenizer=train_model.tokenizer,
-                    verifier=verifier.verify,
                     teacher_client=teacher_client,
-                    semaphore_limit=cfg.engine_semaphore_limit,
                 )
                 gen_end = time.time()
 
@@ -398,13 +293,8 @@ class GRPOPipeline:
                 grpo_stats, hint_samples, direct_samples, _ = self._backward_pass(
                     batch=batch,
                     current=current,
-                    # TODO: Bring this back for teacher refinement
-                    # refined=refined,
-                    refined=[],
+                    refined=refined,
                     algo=algo,
-                    train_model=train_model,
-                    tokenizer=train_model.tokenizer,
-                    cfg=cfg,
                 )
                 backprop_end = time.time()
 
@@ -420,7 +310,9 @@ class GRPOPipeline:
 
                 # Gradient clipping
                 # TODO: Research what it does, how it affects process
-                torch.nn.utils.clip_grad_norm_(trainable_params, cfg.grad_clip)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    trainable_params, cfg.grad_clip
+                )
 
                 # TODO: Will it help to hold of few steps to accumulate gradients first? will it make process resilient to degradation
                 # Update weights
@@ -453,94 +345,54 @@ class GRPOPipeline:
                     sft_optimizer.step()
                     sft_optimizer.zero_grad(set_to_none=True)
 
-                # Save adapter + state
-                # FIX: guard with `step > 0` so we don't waste a save at step 0
-                # before any gradient update has occurred.
-                if step > 0:
-                    # Buffer location for current on-policy LoRA (swapped every step)
-                    # this could be simplified, but its easy to see current step without logging in tmux every time
-                    buffer_dir = self._lora_buffer_dir / f"step_{step}"
+                # Save adapter + state after every update so vLLM stays on-policy.
+                # Buffer location for current on-policy LoRA (swapped every step)
+                # this could be simplified, but its easy to see current step without logging in tmux every time
+                buffer_dir = self._lora_buffer_dir / f"step_{step}"
 
-                    # Remove old buffer to save disk
-                    for old_buf in self._lora_buffer_dir.glob("step_*"):
-                        if old_buf != buffer_dir:
-                            shutil.rmtree(old_buf, ignore_errors=True)
+                # Remove old buffer to save disk
+                for old_buf in self._lora_buffer_dir.glob("step_*"):
+                    if old_buf != buffer_dir:
+                        shutil.rmtree(old_buf, ignore_errors=True)
 
-                    buffer_dir.mkdir(parents=True, exist_ok=True)
+                buffer_dir.mkdir(parents=True, exist_ok=True)
+                try:
+
+                    # Switch to eval mode before saving
+                    # TODO: Why
+                    train_model.model.eval()
+                    train_model.save_lora_adapter("default", str(buffer_dir))
+                    train_model.model.train()
+                    _write_checkpoint_state(buffer_dir, step)
+
+                    # Swap vLLM to the new on-policy LoRA immediately.
+                    # This keeps the generation model synchronized with training.
                     try:
+                        await self.engine.swap_lora_adapter(
+                            cfg.student_adapter_name,
+                            str(buffer_dir),
+                            load_inplace=False,
+                        )
+                        self._active_engine_adapter = cfg.student_adapter_name
+                        self._lora_in_vllm = True
+                    except Exception as exc:
+                        tqdm.write(f"[lora-swap] failed to swap LoRA in vLLM: {exc}")
+                        tqdm.write(
+                            "[lora-swap] continuing with base model for generation"
+                        )
+                        self._lora_in_vllm = False
 
-                        # Switch to eval mode before saving
-                        # TODO: Why
-                        # TODO: make helper function of saving lora adapters with metadata since we may just continue training from buffer lora
-                        train_model.model.eval()
-                        train_model.save_lora_adapter("default", str(buffer_dir))
-                        train_model.model.train()
+                    # Every save_lora_every steps, also persist a permanent checkpoint
+                    if step % cfg.save_lora_every == 0:
+                        save_dir = Path(cfg.run_dir) / "student_lora" / f"step_{step}"
+                        if save_dir.exists():
+                            shutil.rmtree(save_dir)
+                        shutil.copytree(buffer_dir, save_dir)
+                        tqdm.write(f"[checkpoint] saved permanent LoRA at step {step}")
 
-                        # Swap vLLM to the new on-policy LoRA immediately.
-                        # This keeps the generation model synchronized with training.
-                        try:
-                            await self.engine.swap_lora_adapter(
-                                cfg.student_adapter_name,
-                                str(buffer_dir),
-                                load_inplace=False,  # Inplace loading is deprecated since vllm with inplace loading of lora was making generation slow
-                                # TODO: Report this bug to vLLM
-                            )
-                            self._active_engine_adapter = cfg.student_adapter_name
-                            self._lora_in_vllm = True
-                        except Exception as exc:
-                            tqdm.write(
-                                f"[lora-swap] failed to swap LoRA in vLLM: {exc}"
-                            )
-                            tqdm.write(
-                                "[lora-swap] continuing with base model for generation"
-                            )
-                            self._lora_in_vllm = False
-
-                        # Every save_lora_every steps, also persist a permanent checkpoint
-                        # TODO: make helper function for this saving with metadata etc, use that for above
-                        if step % cfg.save_lora_every == 0:
-                            save_dir = (
-                                Path(cfg.run_dir) / "student_lora" / f"step_{step}"
-                            )
-                            if save_dir.exists():
-                                shutil.rmtree(save_dir)
-                            shutil.copytree(buffer_dir, save_dir)
-
-                            with (save_dir / "meta.json").open("w") as f:
-                                json.dump(
-                                    {
-                                        "step": step,
-                                        "adapter_name": cfg.student_adapter_name,
-                                    },
-                                    f,
-                                )
-                            torch.save(
-                                optimizer.state_dict(), save_dir / "optimizer.pt"
-                            )
-                            torch.save(
-                                sft_optimizer.state_dict(),
-                                save_dir / "sft_optimizer.pt",
-                            )
-                            torch.save(loader.state_dict(), save_dir / "curriculum.pt")
-                            torch.save(
-                                {
-                                    "python": random.getstate(),
-                                    "torch": torch.random.get_rng_state(),
-                                    "cuda": (
-                                        torch.cuda.get_rng_state_all()
-                                        if torch.cuda.is_available()
-                                        else None
-                                    ),
-                                },
-                                save_dir / "rng.pt",
-                            )
-                            tqdm.write(
-                                f"[checkpoint] saved permanent LoRA at step {step}"
-                            )
-
-                    except Exception:
-                        shutil.rmtree(buffer_dir, ignore_errors=True)
-                        raise
+                except Exception:
+                    shutil.rmtree(buffer_dir, ignore_errors=True)
+                    raise
 
                 # Step-level logging (ALWAYS print GRPO, even if no SFT)
                 combined_pass_rate = (
@@ -555,6 +407,7 @@ class GRPOPipeline:
                     f"mean_bucket={loader.distribution.mean:.2f} "
                     f"pass={combined_pass_rate:.3f} "
                     f"grpo_loss={grpo_bp_loss:.6f} "
+                    f"grad_norm={float(grad_norm):.3f} "
                     # f"sft_hint_loss={(0.0 if not hint_samples else hint_loss):.6f} "
                     # f"sft_direct_loss={(0.0 if not direct_samples else direct_loss):.6f} "
                     f"gen={gen_end - gen_start:.1f}s "
@@ -564,9 +417,13 @@ class GRPOPipeline:
                 )
 
                 per_task_rates = [
-                    round(self._task_stats[str(p.id)]["last_pass_rate"], 2)
+                    round(
+                        sum(1 for r in current if r["problem"] is p and r["passed"])
+                        / len([r for r in current if r["problem"] is p]),
+                        2,
+                    )
                     for p in batch
-                    if str(p.id) in self._task_stats
+                    if any(r["problem"] is p for r in current)
                 ]
                 per_task_rewards = [
                     round(
@@ -584,11 +441,6 @@ class GRPOPipeline:
                 # What was the average reward for each task?
                 tqdm.write(f"per-task avg reward: {per_task_rewards}")
 
-                stats_path = Path(cfg.run_dir) / "task_stats.json"
-                stats_path.parent.mkdir(parents=True, exist_ok=True)
-                with stats_path.open("w") as f:
-                    json.dump(self._task_stats, f, indent=2)
-
                 step += 1
                 step_bar.update(1)
 
@@ -596,7 +448,6 @@ class GRPOPipeline:
             step_bar.close()
             await self._engine_shutdown(self.engine)
 
-    # TODO: Remove unnecessary dep injection
     def _backward_pass(
         self,
         *,
@@ -604,9 +455,6 @@ class GRPOPipeline:
         current: list[dict],
         refined: list[dict],
         algo: GRPOAlgo,
-        train_model,
-        tokenizer,
-        cfg: TrainConfig,
     ) -> tuple[list[dict], list[tuple], list[tuple], str]:
         """
         Returns
@@ -618,6 +466,10 @@ class GRPOPipeline:
 
         # TODO: Use this device param to expand training process to two gpus, one for generation, other for backprop
         # TODO: Why we need a next here? Why an active lora adapters, maybe for reference logprobs, but investigate still
+        train_model = self.train_model
+        tokenizer = self.tokenizer
+        cfg = self.cfg
+
         device = next(train_model.model.parameters()).device
         active_name = "default"
         train_model.set_active_lora_adapter(active_name)
@@ -641,38 +493,27 @@ class GRPOPipeline:
                 )
             )
 
-        # Compute per-problem pass ratios
-        # TODO: This block up until the end seems useless? what its doing here?
-        pass_ratio_by_problem: dict[str, float] = {}
-        for problem in batch:
-            rows = [r for r in current if r["problem"] is problem]
-            if rows:
-                pass_ratio_by_problem[str(problem.id)] = sum(
-                    1 for r in rows if r["passed"]
-                ) / len(rows)
-
-        PASS_RATIO_THRESHOLD = 0.25
-
         # SFT sample collection with gating
-        # TODO: Bring this back for teacher refinement
-        # hint_samples: list[tuple[list[dict], str]] = [
-        #     (r["sft_hint_messages"], r["sft_hint_text"])
-        #     for r in refined
-        # ]
-        # direct_samples: list[tuple[list[dict], str]] = [
-        #     (r["sft_direct_messages"], r["sft_direct_text"])
-        #     for r in refined
-        #     if r.get("sft_direct_messages") and r.get("sft_direct_text")
-        # ]
-        hint_samples = []
-        direct_samples = []
+        hint_samples: list[tuple[list[dict], str]] = [
+            (r["sft_hint_messages"], r["sft_hint_text"])
+            for r in refined
+            if r.get("sft_hint_messages") and r.get("sft_hint_text")
+        ]
+        direct_samples: list[tuple[list[dict], str]] = [
+            (r["sft_direct_messages"], r["sft_direct_text"])
+            for r in refined
+            if r.get("sft_direct_messages") and r.get("sft_direct_text")
+        ]
         return grpo_stats, hint_samples, direct_samples, active_name
 
     # Make sure vllm engine inits with lora adapters and we have reference lora for training model too
-    async def _ensure_adapters(self, train_model, cfg: TrainConfig) -> None:
+    async def _ensure_adapters(self) -> None:
         if self._adapters_initialized:
             return
         self._adapters_initialized = True
+
+        train_model = self.train_model
+        cfg = self.cfg
 
         if cfg.student_adapter_path:
             student_path = Path(cfg.student_adapter_path).expanduser().resolve()
@@ -712,121 +553,41 @@ class GRPOPipeline:
         batch: list[Problem],
         *,
         step: int,
-        train_model,
-        tokenizer,
-        verifier: Callable[[Problem, str], Score],
         teacher_client: Optional[BaseClient] = None,
-        semaphore_limit: int = 32,
         refine_mode: str = "current",
     ) -> tuple[list[dict], list[dict], int, int]:
         cfg = self.cfg
         profile = self.profile
 
-        await self._ensure_adapters(train_model, cfg)
+        await self._ensure_adapters()
 
-        sem = asyncio.Semaphore(max(1, semaphore_limit))
+        sem = asyncio.Semaphore(max(1, cfg.engine_semaphore_limit))
         use_lora = self._lora_in_vllm
 
-        # make generationi requests to vllm
-        # TODO: Move this function to utils for easy management
-        async def _generate(messages: list[dict]) -> Optional[str]:
-            model_name = (
-                self._active_engine_adapter if use_lora else cfg.model_path
-            )  # vllm uses lora name as model name for distinction
-            payload = {
-                "model": model_name,
-                "messages": messages,
-                "temperature": cfg.temperature,
-                "max_tokens": cfg.max_tokens,
-                "stream": False,
-            }
-            payload.update(
-                profile.gen_extra_payload
-            )  # extra payload to use thinking mode, etc
-
-            # make a request with semaphore
-            async with sem:
-                resp = await self.engine._request_json(
-                    "POST", "/chat/completions", payload
-                )
-            choices = resp.get("choices") or []
-            if not choices:
-                return None
-            raw_msg = choices[0].get("message") or {}
-
-            # get reasoning and main content seperately, then add gemma formatting later
-            # TODO: make this model agnostic everywhere
-            reasoning = str(raw_msg.get("reasoning") or "").strip()
-            content = str(raw_msg.get("content") or "").strip()
-            if reasoning:
-                return f"<|channel|>thought\n{reasoning}\n<channel|>\n{content}"
-            else:
-                return f"{content}<turn|>"
-
-        # TODO: move this to utils to reduce lines
-        def _is_clean_logs(compile_logs: str, stdout: str = "") -> bool:
-            combined = f"{compile_logs or ''} {stdout or ''}".lower()
-            if not combined.strip():
-                return True
-            return not any(
-                kw in combined
-                for kw in [
-                    "warning:",
-                    "error:",
-                    "note:",
-                    "implicit",  # compiler
-                    "addresssanitizer",
-                    "undefined behavior",  # sanitizers
-                    "segmentation fault",
-                    "segfault",
-                    "abort",  # runtime crashes
-                ]
+        async def _generate(messages: list[dict]):
+            return await _vllm_generate(
+                messages,
+                engine=self.engine,
+                sem=sem,
+                use_lora=use_lora,
+                active_adapter=self._active_engine_adapter,
+                model_path=cfg.model_path,
+                temperature=cfg.temperature,
+                max_tokens=cfg.max_tokens,
+                gen_extra_payload=profile.gen_extra_payload,
             )
-
-        # Commented-out old scoring logic (kept for reference)
-        # async def _score(problem: Problem, text: str):
-        #     m = re.search(r"```c\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
-        #     extracted = m.group(1).strip() if m else text
-        #     sc = verifier(problem, extracted)
-        #     details = sc.details or {}
-        #     total_external = details.get("total_external_functions_executed")
-        #     total_correct = details.get("total_correct_functions_executed")
-        #     compile_logs = details.get("compile_logs", "") or ""
-        #     stdout = details.get("stdout", "") or ""
-        #     clean = _is_clean_logs(compile_logs, stdout)
-        #     if sc.compiled:
-        #         reward = 1.0
-        #         reward += 0.2 if clean else -0.2
-        #         if total_external is not None and total_correct is not None:
-        #             if total_external > 0:
-        #                 fn_ratio = float(total_correct) / total_external
-        #                 if fn_ratio < 1.0:
-        #                     reward = reward * fn_ratio
-        #             else:
-        #                 reward = 0.0
-        #     else:
-        #         reward = 0.0
-        #         if total_external is not None and total_correct is not None:
-        #             if total_external > 0:
-        #                 reward = 0.5 * (float(total_correct) / total_external)
-        #     required_funcs = problem.metadata["required"]
-        #     analyzer = FunctionCallAnalyzer()
-        #     called = analyzer.extract_called_functions(extracted)
-        #     present = [fn for fn in required_funcs if fn in called]
-        #     fn_ratio_required = len(present) / len(required_funcs)
-        #     reward = reward * fn_ratio_required
-        #     compiled_success = bool(sc.compiled)
-        #     return sc, reward, compiled_success
 
         # TODO: make this score function more coherent and proper
         # Also, move this into verifier logic to make the pipeline task agnostic
         async def _score(problem: Problem, text: str):
-            m = re.search(r"```c\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
-            extracted = m.group(1).strip() if m else text
-            sc = verifier(problem, extracted)
+            extracted = _as_c_block(text)
+            extracted = (
+                extracted.removeprefix("```c\n").removesuffix("\n```")
+                if extracted
+                else text
+            )
+            sc = self.verifier(problem, extracted)
             details = sc.details or {}
-            total_external = details.get("total_external_functions_executed")
-            total_correct = details.get("total_correct_functions_executed")
             compile_logs = details.get("compile_logs", "") or ""
             stdout = details.get("stdout", "") or ""
             clean = _is_clean_logs(compile_logs, stdout)
@@ -851,7 +612,6 @@ class GRPOPipeline:
             return sc, reward, compiled_success
 
         # Rollout generation + scoring
-        # TODO: De-Activate later when vllm fixes lora loading for gemma4
         gen_tasks = []
         for problem in batch:
             messages = [
@@ -884,10 +644,11 @@ class GRPOPipeline:
             )
             for task in done:
                 tasks.remove(task)  # remove it as its done
-                txt = task.result()
+                gen_out = task.result()
                 problem, messages = task_to_metadata[task]
-                if txt is None:
+                if gen_out is None:
                     continue
+                txt, reasoning, content = gen_out
                 sc, reward, passed = await _score(problem, txt)
 
                 # TODO: Handle logging better, rather than each in seperate file
@@ -900,6 +661,8 @@ class GRPOPipeline:
                     messages=messages,
                     output=txt,
                     score=sc,
+                    reasoning=reasoning,
+                    content=content,
                 )
                 current.append(
                     dict(
@@ -915,24 +678,6 @@ class GRPOPipeline:
 
         _log_rollout_stats("grpo-rollouts", current)
 
-        # TODO: Remove task stats management, we are not using it
-        for problem in batch:
-            rows = [r for r in current if r["problem"] is problem]
-            if not rows:
-                continue
-            pid = str(problem.id)
-            last_passed = sum(1 for r in rows if r["passed"])
-            last_total = len(rows)
-            last_reward = sum(r["reward"] for r in rows)
-            s = self._task_stats.setdefault(
-                pid, {"total_attempts": 0, "total_passed": 0, "total_reward": 0.0}
-            )
-            s["total_attempts"] += last_total
-            s["total_passed"] += last_passed
-            s["total_reward"] = s.get("total_reward", 0.0) + last_reward
-            s["overall_pass_rate"] = round(s["total_passed"] / s["total_attempts"], 3)
-            s["last_pass_rate"] = round(last_passed / last_total, 3)
-
         # Calculating pass ratio for each task, if it crosses a threshold,
         # will skip teacher refinement as GRPO signal is enough for moving gradients for that problem
         pass_ratio_by_problem: dict[str, float] = {}
@@ -942,8 +687,6 @@ class GRPOPipeline:
                 pass_ratio_by_problem[str(problem.id)] = sum(
                     1 for r in rows if r["passed"]
                 ) / len(rows)
-
-        PASS_RATIO_THRESHOLD = 0.25
 
         refine_candidates_all = {
             "current": [r for r in current if not r["passed"]],
@@ -966,7 +709,6 @@ class GRPOPipeline:
             refined, hints_given, passed_after_hint = await teacher_refine(
                 self, refine_candidates, _generate, _score, teacher_client, sem, step
             )
-        # _log_rollout_stats("teacher-fixes", refined, extra=f"hints={hints_given}")
 
         self._prev_failed_rollouts = build_failed_cache(current)
         return current, refined, hints_given, passed_after_hint
@@ -1006,11 +748,7 @@ class GRPOPipeline:
         rewards = list(rewards)
 
         # Tokenize prompt + completions
-        prompt_text = tokenizer.apply_chat_template(
-            base_messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        prompt_text = _build_prompt_text(tokenizer, base_messages)
         prompt_tok = tokenizer(prompt_text, return_tensors="pt")
         prompt_ids = prompt_tok["input_ids"].to(device, non_blocking=True)
         prompt_mask = prompt_tok["attention_mask"].to(device, non_blocking=True)
@@ -1031,6 +769,11 @@ class GRPOPipeline:
         full_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         full_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         comp_len = completion_ids.shape[1]
+
+        # Reset any previous rollout state before binding current logprobs.
+        algo.bind_old_logprobs(None)
+        if hasattr(algo, "bind_ref_logprobs"):
+            algo.bind_ref_logprobs(None)
 
         # --- old_lp: from train_model BEFORE weight update ---
         # At step 0: train_model = vLLM = SFT primer -> old_lp ~ gen_lp -> ratio ~ 1

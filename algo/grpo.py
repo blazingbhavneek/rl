@@ -49,16 +49,9 @@ class GRPOAlgo(BaseAlgo):
     def bind_old_logprobs(self, old_logprobs: Optional[Tensor]) -> None:
         self._old_logprobs = old_logprobs
 
-    # TODO: Remove this, advantages should always be normalized, can simplify this code
     def compute_advantages(self, rewards: Tensor) -> Tensor:
-        if self.config.norm_advantages:
-            return normalize_advantages(rewards)
-        return rewards.float()
+        return normalize_advantages(rewards.float())
 
-    # TODO: Re-check this flow.
-    # `process_rollouts()` clears `_ref_logprobs` and `_old_logprobs`
-    # before returning the loss function, so KL / PPO only work if
-    # something re-binds them before that loss is actually executed.
     # main entry point of algorithm
     def process_rollouts(
         self,
@@ -89,36 +82,7 @@ class GRPOAlgo(BaseAlgo):
         # Convert rollout rewards to tensor for group-level advantage computation.
         rewards_t = torch.tensor(rewards, dtype=torch.float32)
 
-        # GRPO uses scalar rollout rewards and converts them to group-relative advantages.
-        # Fallback when rewards collapse (all same): use verifier-derived dense proxy.
-        # TODO: Remove this fallback, this is source of problems, already explicit score functions are 
-        # supposed to be defined in task sets, having it here makes no sense 
-        # Simply use the scores assinged
-        if rewards_t.numel() > 0 and torch.isclose(
-            rewards_t.std(unbiased=False),
-            torch.zeros((), dtype=rewards_t.dtype),
-            atol=1e-8,
-        ):
-            dense = []
-            for sc in scores:
-                ratio = (float(sc.passed) / float(sc.total)) if sc.total > 0 else 0.0
-                dense.append(ratio + (0.1 if bool(sc.compiled) else 0.0))
-            dense_t = torch.tensor(dense, dtype=torch.float32)
-            advantages = self.compute_advantages(dense_t)
-            if torch.isclose(
-                advantages.std(unbiased=False),
-                torch.zeros((), dtype=advantages.dtype),
-                atol=1e-8,
-            ):
-                # Last-resort tiny rank-centered signal to avoid all-zero no-op steps.
-                idx = torch.arange(g, dtype=torch.float32)
-                advantages = normalize_advantages(idx)
-        else:
-            advantages = self.compute_advantages(rewards_t)
-
-        # Clear previously bound logprobs
-        self._ref_logprobs = None
-        self._old_logprobs = None
+        advantages = self.compute_advantages(rewards_t)
 
         # If KL coefficient > 0, prepare to pass prompt_ids to the loss function (needed to compute KL penalty later)
         ref_prompt_ids = prompt_ids if self.config.kl_coeff > 0.0 else None
