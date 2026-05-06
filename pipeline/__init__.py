@@ -1,4 +1,4 @@
-from .grpo_teacher import GRPOPipeline, TrainConfig
+from .grpo.grpo import GRPOPipeline, TrainConfig
 
 __all__ = [
     "GRPOTeacherPipeline",

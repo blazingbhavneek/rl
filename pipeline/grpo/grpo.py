@@ -3,292 +3,47 @@
 # What this import does?
 from __future__ import annotations
 
-# 3rd party
-import time
-import json
-import random
-import shutil
-import re
-import os
-import json
-import torch
-import random
 import asyncio
 import importlib
-from torch import Tensor
+import json
+import os
+import random
+import re
+import shutil
+
+# 3rd party
+import time
+from collections import Counter
+from itertools import count
 from pathlib import Path
 from pprint import pprint
-from tqdm.auto import tqdm
-from itertools import count
-from collections import Counter
 from typing import Callable, Optional
-from datetime import datetime, timezone
-from dataclasses import dataclass, field
-from langchain_openai import ChatOpenAI
-from tree_sitter import Parser, Language
-from langchain_core.messages import HumanMessage
-from tree_sitter_c import language as c_language
-from langchain_mcp_adapters.client import MultiServerMCPClient
 
+import torch
+from tqdm.auto import tqdm
 
 # Within Repo
 from algo import AlgoConfig
 from algo.grpo import GRPOAlgo
-from inference import VLLMEngine
 from client.base import BaseClient
-from client.agent import AgentClient
+from inference import VLLMEngine
 from model.config import ModelConfig
-from taskset.base import Problem, Score
-from client.tools import build_markdown_rag_tool
 from taskset import BucketDistribution, CurriculumLoader
+from taskset.base import Problem, Score
 from taskset.moove.verify import RemoteDockerVerifier
 
+from .config import TrainConfig
+from .teacher import build_failed_cache, init_teacher_client, sft_step, teacher_refine
+from .utils import (
+    FunctionCallAnalyzer,
+    _get_profile,
+    _log_rollout_stats,
+    write_generation_log,
+)
+
 # endregion Imports
-
-# region Utils
-
-# This parses C code to check which functions were called in code, written to check whether required function were called or not
-# otherwise model learns to game the system by either calling no functions or calling random other functions that are easy to compile
-class FunctionCallAnalyzer:
-
-    def __init__(self):
-
-        # Initialize parser
-        self.parser = Parser(Language(c_language()))
-
-    # Make a set of functions that were called in the given code
-    def extract_called_functions(self, code: str) -> set[str]:
-        tree = self.parser.parse(code.encode("utf8")) # encode it incase of euc_jp encoding?
-        called = set()
-
-        # Recursive function that goes through all entities
-        def visit(node):
-            if node.type == "call_expression": # call expression is node for when a function is called
-                fn = node.child_by_field_name("function")
-                if fn:
-                    name = self._extract_name(fn) # for handling multiple types of function calls
-                    if name:
-                        called.add(name)
-            for c in node.children:
-                visit(c)
-
-        visit(tree.root_node)
-        return called
-
-    # Extracting name of function called, either direct calls (ret = foo(x)) which have identifiers, or calling methods (ret = obj.foo(x))
-    def _extract_name(self, node):
-        if node.type == "identifier":
-            return node.text.decode() # nodes have encoded code, we need to decode it to get string
-        if node.type == "field_expression":
-            f = node.child_by_field_name("field") 
-            if f:
-                return f.text.decode()
-        return None
-
-
-analyzer = FunctionCallAnalyzer()
-
-# Final correct response made with teacher's help needs to have its own Chain of thought
-COT_SYSTEM_PROMPT = """\
-You are generating chain-of-thought data for training a reasoning model.
-Write the internal reasoning an expert C programmer would have when solving
-the task, based on programming theory, API knowledge, and implementation planning.
-
-Rules:
-- Do NOT mention tools, verification, or compilation.
-- Do NOT refer to any external process.
-- Do NOT invent behavior not present in the code.
-- Keep the reasoning technical, neutral, and educational.
-- The output should be long and informative
-- Use the specialist to ask questions properly first, dont include any information
-  in the output that wasnt retrieved or checked by specialist
-- Research properly, about the code and theory to make a correct and technically
-  sound reasoning
-- Answer should be simple text, no formatting, no codeblocks, no markdown or code
-- Answer like a person thinking, not announcements
-
-Bad output:
-- An expert C programmer analyzing the task to write a minimal program using...
-- When approaching the task of writing a minimal C program that uses mpf_mfs_stuprqbf,
-  an expert C programmer would begin by examining the function...
-- I need to first understand what this function does and how it fits into the PMF
-  library architecture ...
-
-Good output:
-- I need to first understand what users want. The user wants to write C code ...
-  know that this function ...
-
-Dont let the reasoning show that you dont know, the model knows it already. The
-reasoning should always sound confident.
-Give long reasoning traces rich with information.
-"""
-
-
-
-@dataclass(frozen=True)
-class _ModelProfile:
-    module: str # which class from the model module we need to import for this, which are subclasses of BaseModel
-    cls_name: str # Name of the subclass  
-    reasoning_parser: Optional[str] # reasoning parser used by vllm
-    tool_call_parser: str # tool call parser used by vllm
-    teacher_extra_body: dict # some calls may need extra kwargs to enable thinking from server side
-    gen_extra_payload: dict
-
-
-_MODEL_PROFILES: dict[str, _ModelProfile] = {
-    "qwen3": _ModelProfile(
-        module="model.qwen3",
-        cls_name="Qwen3Model",
-        reasoning_parser="qwen3",
-        tool_call_parser="hermes",
-        teacher_extra_body={"chat_template_kwargs": {"enable_thinking": True}},
-        gen_extra_payload={"chat_template_kwargs": {"enable_thinking": True}},
-    ),
-    "qwen3_5": _ModelProfile(
-        module="model.qwen3_5",
-        cls_name="Qwen3_5Model",
-        reasoning_parser="qwen3",
-        tool_call_parser="qwen3_coder",
-        teacher_extra_body={"chat_template_kwargs": {"enable_thinking": True}},
-        gen_extra_payload={"chat_template_kwargs": {"enable_thinking": True}},
-    ),
-    "gptoss": _ModelProfile(
-        module="model.gptoss",
-        cls_name="GptOssModel",
-        reasoning_parser=None,
-        tool_call_parser="openai",
-        teacher_extra_body={},
-        gen_extra_payload={"include_reasoning": True},
-    ),
-    "gemma": _ModelProfile(
-        module="model.gemma4",
-        cls_name="Gemma4Model",
-        # match vLLM launch flags
-        reasoning_parser="gemma4",
-        tool_call_parser="gemma4",
-        teacher_extra_body={},       # do NOT force enable_thinking
-        gen_extra_payload={},        # let reasoning be server-controlled
-    ),
-}
-
-# TODO: clean it up
-def _get_profile(model_type: str) -> _ModelProfile:
-    if model_type not in _MODEL_PROFILES:
-        raise ValueError(
-            f"Unknown model_type {model_type!r}. Choose from: {list(_MODEL_PROFILES)}"
-        )
-    return _MODEL_PROFILES[model_type]
-
-
-# Get one valid answer if any, so teacher can have a reference when suggesting fix for wrong ones?
-# TODO: clean it up, called only once
-def _sample_ref_answer(problem) -> Optional[str]:
-    raw = (problem.metadata or {}).get("answer", None)
-    if not raw:
-        return None
-    if isinstance(raw, list):
-        valid = [s for s in raw if s and isinstance(s, str)]
-        return random.choice(valid) if valid else None
-    if isinstance(raw, str):
-        return raw.strip() or None
-    return None
-
-# endregion Utils
-
-# region Training config
-
-@dataclass
-class TrainConfig:
-
-    # --- model ---
-    model_path: str
-    model_type: str = "qwen3"
-    lora_targets: list[str] = field(
-        default_factory=lambda: ["gate_proj", "up_proj", "down_proj"]
-    )
-    lora_fraction: float = 0.5
-    lora_rank: int = 64
-    lora_alpha: int = 128
-    chunk_size: int = 256
-    cuda_device_index: int = 0
-    use_grad_checkpoint: bool = True
-
-    # --- inference engine ---
-    engine_base_url: str = "http://127.0.0.1:8000/v1"
-    engine_api_key: str = "EMPTY"
-    engine_gpu_memory_utilization: float = 0.60
-    engine_semaphore_limit: int = 64
-
-    # --- external teacher ---
-    teacher_base_url: str = None
-    teacher_api_key: str = None
-    teacher_model_name: str = None
-
-    # --- rollouts ---
-    n_rollouts: int = 8
-    temperature: float = 0.7
-    system_prompt: str = "Solve the problem in C. Return only one `c` block."
-    max_tokens: int = 1024
-
-    # --- teacher ---
-    teacher_max_tokens: int = 8000
-    teacher_temperature: float = 0.2
-    max_hint_attempts: int = 1
-    hint_reward_discount: float = 0.7
-    teacher_max_turns: int = 3
-
-    # --- LoRA adapters ---
-    run_dir: str = "fast_checkpoints3/grpo_run"
-    student_adapter_name: str = "student"
-    student_adapter_path: Optional[str] = None
-    ref_adapter_name: Optional[str] = None
-    ref_adapter_path: Optional[str] = None
-
-    # --- GRPO algo ---
-    kl_coeff: float = 0.0
-    clip_ratio_low: float = 0.2
-    clip_ratio_high: float = 0.28
-    norm_advantages: bool = True
-
-    # --- optimizer ---
-    lr: float = 2e-5
-    grad_clip: float = 1.0
-    sft_lr: float = 5e-5  # FIX: restored from old pipeline (was 1e-5)
-
-    # --- curriculum ---
-    dataset_dir: str = "taskset/codeforces/data"
-    train_steps: int = 10
-    sample_size: int = 10
-    curriculum_n_buckets: int = 9
-    curriculum_initial_mean: float = 0.6
-    curriculum_std: float = 1.0
-    solve_threshold: float = 0.8
-    consecutive_required: int = 2
-    min_evaluated: int = 8
-    shift_delta: float = 1.0
-    shift_window_radius: int = 0
-    rolling_window: int = 20
-    require_full_bucket_coverage: bool = True
-
-    # --- verifier ---
-    verifier_timeout: float = 5.0
-    verifier_workers: int = 16
-    save_lora_every: int = 20
-    gen_batch_size: int = 64
-
-    # --- Embeddings for Teacher model usage
-    docs_folder: str = "/home/seigyo/rl/sft_primer/input/moove"
-    embedding_backend: str = os.environ.get("EMBEDDING_BACKEND", "huggingface")
-    embedding_base_url: str = os.environ.get(
-        "EMBEDDING_BASE_URL", "http://10.160.144.101:51028/v1"
-    )
-    embedding_api_key: str = os.environ.get("EMBEDDING_API_KEY", "EMPTY")
-    embedding_model: str = os.environ.get("EMBEDDING_MODEL", "cl-nagoya/ruri-v3-30m")
-
-# endregion Training config
-
-
 # region Pipeline
+
 
 class GRPOPipeline:
     """
@@ -351,7 +106,7 @@ class GRPOPipeline:
         # Defensive: trim any junk before the Gemma reasoning marker
         for marker in ("<|channel|>thought",):
             if marker in text:
-                text = text[text.index(marker):]
+                text = text[text.index(marker) :]
                 break
 
         # Gemma4 format:
@@ -443,76 +198,6 @@ class GRPOPipeline:
 
     # endregion HF gen specific functions
 
-
-    def _write_generation_log(
-        self,
-        *,
-        step: int,
-        model_name: str,
-        messages: list[dict],
-        output: Optional[str],
-        score=None,
-        finish_reason: Optional[str] = None,
-        error: Optional[str] = None,
-    ) -> None:
-        log_dir = Path("gen_logs") / f"step_{step}"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
-        idx = next(self._gen_log_counter)
-        path = log_dir / f"gen_{ts}_{idx:06d}.md"
-
-        with path.open("w", encoding="utf-8") as f:
-            f.write("# Student Generation\n\n")
-            f.write(f"- step: `{step}`\n")
-            f.write(f"- model: `{model_name}`\n")
-            if finish_reason is not None:
-                f.write(f"- finish_reason: `{finish_reason}`\n")
-            if error is not None:
-                f.write(f"- error: `{error}`\n")
-            f.write("\n")
-
-            f.write("## Message History\n\n")
-            for i, m in enumerate(messages, 1):
-                role = m.get("role", "unknown")
-                f.write(f"### {i}. {role}\n\n")
-                content = m.get("content", "")
-                if isinstance(content, str):
-                    f.write(f"{content}\n\n")
-                else:
-                    f.write("```json\n")
-                    f.write(json.dumps(content, ensure_ascii=False, indent=2))
-                    f.write("\n```\n\n")
-
-            f.write("## Full Prompt\n\n")
-            prompt_text = self._build_prompt_text(messages)
-            f.write(f"```text\n{prompt_text}\n```\n\n")
-
-            f.write("## Response\n\n")
-            if output is not None:
-                reasoning, content = self._split_reasoning_and_content(output)
-                f.write("### Reasoning\n\n")
-                f.write(f"```text\n{reasoning}\n```\n\n")
-                f.write("### Content\n\n")
-                f.write(f"```text\n{content}\n```\n\n")
-            else:
-                f.write("_No output returned._\n")
-
-            # Add compile logs if available
-            if score is not None and hasattr(score, "details") and score.details:
-                details = score.details or {}
-                compile_logs = details.get("compile_logs", "") or ""
-                stdout = details.get("stdout", "") or ""
-                if compile_logs or stdout:
-                    f.write("## Compile Logs\n\n")
-                    f.write("```\n")
-                    if compile_logs:
-                        f.write(compile_logs)
-                    if stdout:
-                        if compile_logs:
-                            f.write("\n")
-                        f.write(stdout)
-                    f.write("\n```\n")
-
     # Training loop
 
     async def train(self, teacher_client: Optional[BaseClient] = None) -> None:
@@ -521,7 +206,7 @@ class GRPOPipeline:
         profile = self.profile
 
         ### Model + optimizers ###
-        
+
         model_cfg = ModelConfig(
             lora=cfg.lora_targets,
             lora_fraction=cfg.lora_fraction,
@@ -536,7 +221,8 @@ class GRPOPipeline:
         train_model = ModelCls(
             cfg.model_path,
             model_cfg,
-            lora_path=cfg.student_adapter_path or None, # Either continuation of a SFT'ed Lora or start fresh
+            lora_path=cfg.student_adapter_path
+            or None,  # Either continuation of a SFT'ed Lora or start fresh
         )
 
         self.tokenizer = train_model.tokenizer
@@ -544,8 +230,9 @@ class GRPOPipeline:
             p for p in train_model.model.parameters() if p.requires_grad
         ]
         optimizer = torch.optim.AdamW(trainable_params, lr=cfg.lr)
-        sft_optimizer = torch.optim.AdamW(trainable_params, lr=cfg.sft_lr) # TODO: Search for A better optimizer? or an LR scheduler?
-
+        sft_optimizer = torch.optim.AdamW(
+            trainable_params, lr=cfg.sft_lr
+        )  # TODO: Search for A better optimizer? or an LR scheduler?
 
         ### Curriculum ###
 
@@ -648,57 +335,12 @@ class GRPOPipeline:
         self._lora_buffer_dir = Path(cfg.run_dir) / "lora_buffer"
         self._lora_buffer_dir.mkdir(parents=True, exist_ok=True)
 
-        # TODO: Decouple teacher code completely from GRPO
-        # Tools for Teacher
-        mcp_config = {
-            "moove": {
-                "transport": "http",
-                "url": "http://10.160.152.38:9001/mcp",
-            },
-        }
-        mcp_client = MultiServerMCPClient(mcp_config)
-        mcp_tools = await mcp_client.get_tools()
-        rag_tool = build_markdown_rag_tool(
-            docs_folder=cfg.docs_folder,
-            persist_directory="logs/chroma_intel_rag",
-            embedding_backend=cfg.embedding_backend,
-            embedding_base_url=cfg.embedding_base_url,
-            embedding_api_key=cfg.embedding_api_key,
-            embedding_model=cfg.embedding_model,
-        )
-
-        tools = [rag_tool, *mcp_tools]
-
-        AgentClient(
-            base_url=cfg.teacher_base_url or cfg.engine_base_url,
-            api_key=cfg.teacher_api_key or cfg.engine_api_key,
-            temperature=cfg.teacher_temperature,
-            max_output_tokens=cfg.teacher_max_tokens,
-            system_prompt=(
-                "You are a coding tutor helping a student fix their C code. "
-                "Each turn you will see the student's latest attempt and its "
-                "compiler/test output. Give concise targeted hints. "
-                "Tell it how to fix its errors. "
-                "Explain the API reference/theory to it that you understand from the reference material. "
-                "Tell the student model to add the explanations it understood in the comments. "
-                "If a Macro is missing, tell it to define the macro in the code itself, search the documentation for a good default value. "
-                "The student does not have access to any information or reference material, it's your job to give it all information it needs to fix its mistakes. "
-                "Make the student write everything it learns in comments (No CPP style comments) so it remembers what it saw. "
-                "Dont give it final answer directly, guide it to what it needs to change to get good answer, suggest changes and instruct it to add theory in comments. "
-                "The suggestion should be minimal, dont tell it everything, just enough to fix error"
-            ),
-            model=cfg.teacher_model_name or cfg.model_path,
-            tools=tools,
-            max_turns=cfg.teacher_max_turns,
-            extra_body=profile.teacher_extra_body,
-        )
-
-
+        teacher_client = await init_teacher_client(self, teacher_client)
         # Verifier for code
         verifier = RemoteDockerVerifier(timeout=cfg.verifier_timeout)
         verifier.check_dependencies()
 
-        # Algorithm 
+        # Algorithm
         # TODO: Current pipeline is very coupled with algo, need to make it decoupled a lil bit for slightly diff variants of grpo
         algo = GRPOAlgo(
             AlgoConfig(
@@ -717,16 +359,16 @@ class GRPOPipeline:
         try:
 
             # Curriculum loader can be stopped if all the buckets are showing satisfactory results, RL convergance
-            while not loader.should_stop(step): 
+            while not loader.should_stop(step):
 
                 # total time for each step
                 step_t0 = time.time()
-                
+
                 batch = loader.sample(step=step)
                 if not batch:
                     break
 
-                # TODO: Bring this back for teacher refinement, 
+                # TODO: Bring this back for teacher refinement,
                 # A non empty refined means some responses were corrected by teacher model
                 # current, refined, _, _ = await self.run_batch(
                 gen_start = time.time()
@@ -793,7 +435,7 @@ class GRPOPipeline:
                 # Streamline these two, unnecessary breakdown of SFT Steps
                 if hint_samples:
                     sft_optimizer.zero_grad(set_to_none=True)
-                    hint_loss = self._sft_step(
+                    hint_loss = sft_step(
                         samples=hint_samples,
                         train_model=train_model,
                         sft_optimizer=sft_optimizer,
@@ -803,7 +445,7 @@ class GRPOPipeline:
 
                 if direct_samples:
                     sft_optimizer.zero_grad(set_to_none=True)
-                    direct_loss = self._sft_step(
+                    direct_loss = sft_step(
                         samples=direct_samples,
                         train_model=train_model,
                         sft_optimizer=sft_optimizer,
@@ -840,14 +482,18 @@ class GRPOPipeline:
                             await self.engine.swap_lora_adapter(
                                 cfg.student_adapter_name,
                                 str(buffer_dir),
-                                load_inplace=False, # Inplace loading is deprecated since vllm with inplace loading of lora was making generation slow
+                                load_inplace=False,  # Inplace loading is deprecated since vllm with inplace loading of lora was making generation slow
                                 # TODO: Report this bug to vLLM
                             )
                             self._active_engine_adapter = cfg.student_adapter_name
                             self._lora_in_vllm = True
                         except Exception as exc:
-                            tqdm.write(f"[lora-swap] failed to swap LoRA in vLLM: {exc}")
-                            tqdm.write("[lora-swap] continuing with base model for generation")
+                            tqdm.write(
+                                f"[lora-swap] failed to swap LoRA in vLLM: {exc}"
+                            )
+                            tqdm.write(
+                                "[lora-swap] continuing with base model for generation"
+                            )
                             self._lora_in_vllm = False
 
                         # Every save_lora_every steps, also persist a permanent checkpoint
@@ -868,7 +514,9 @@ class GRPOPipeline:
                                     },
                                     f,
                                 )
-                            torch.save(optimizer.state_dict(), save_dir / "optimizer.pt")
+                            torch.save(
+                                optimizer.state_dict(), save_dir / "optimizer.pt"
+                            )
                             torch.save(
                                 sft_optimizer.state_dict(),
                                 save_dir / "sft_optimizer.pt",
@@ -886,7 +534,9 @@ class GRPOPipeline:
                                 },
                                 save_dir / "rng.pt",
                             )
-                            tqdm.write(f"[checkpoint] saved permanent LoRA at step {step}")
+                            tqdm.write(
+                                f"[checkpoint] saved permanent LoRA at step {step}"
+                            )
 
                     except Exception:
                         shutil.rmtree(buffer_dir, ignore_errors=True)
@@ -997,9 +647,9 @@ class GRPOPipeline:
         for problem in batch:
             rows = [r for r in current if r["problem"] is problem]
             if rows:
-                pass_ratio_by_problem[str(problem.id)] = (
-                    sum(1 for r in rows if r["passed"]) / len(rows)
-                )
+                pass_ratio_by_problem[str(problem.id)] = sum(
+                    1 for r in rows if r["passed"]
+                ) / len(rows)
 
         PASS_RATIO_THRESHOLD = 0.25
 
@@ -1038,7 +688,9 @@ class GRPOPipeline:
                     )
                 except Exception as exc:
                     tqdm.write(f"[init] failed to load LoRA adapter into vLLM: {exc}")
-                    tqdm.write("[init] continuing without vLLM LoRA (will use buffer swaps)")
+                    tqdm.write(
+                        "[init] continuing without vLLM LoRA (will use buffer swaps)"
+                    )
                     self._lora_in_vllm = False
             else:
                 tqdm.write(f"[init] student adapter path not found: {student_path}")
@@ -1078,7 +730,9 @@ class GRPOPipeline:
         # make generationi requests to vllm
         # TODO: Move this function to utils for easy management
         async def _generate(messages: list[dict]) -> Optional[str]:
-            model_name = self._active_engine_adapter if use_lora else cfg.model_path # vllm uses lora name as model name for distinction
+            model_name = (
+                self._active_engine_adapter if use_lora else cfg.model_path
+            )  # vllm uses lora name as model name for distinction
             payload = {
                 "model": model_name,
                 "messages": messages,
@@ -1086,7 +740,9 @@ class GRPOPipeline:
                 "max_tokens": cfg.max_tokens,
                 "stream": False,
             }
-            payload.update(profile.gen_extra_payload) # extra payload to use thinking mode, etc
+            payload.update(
+                profile.gen_extra_payload
+            )  # extra payload to use thinking mode, etc
 
             # make a request with semaphore
             async with sem:
@@ -1118,12 +774,12 @@ class GRPOPipeline:
                     "warning:",
                     "error:",
                     "note:",
-                    "implicit",          # compiler
+                    "implicit",  # compiler
                     "addresssanitizer",
                     "undefined behavior",  # sanitizers
                     "segmentation fault",
                     "segfault",
-                    "abort",             # runtime crashes
+                    "abort",  # runtime crashes
                 ]
             )
 
@@ -1199,11 +855,14 @@ class GRPOPipeline:
         gen_tasks = []
         for problem in batch:
             messages = [
-                {"role": "system", "content": "You are a helpful assistant. <|think|>"}, # TODO: Make this model agnostic
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant. <|think|>",
+                },  # TODO: Make this model agnostic
                 {"role": "user", "content": str(problem.statement)},
             ]
             for _ in range(cfg.n_rollouts):
-                # This makes a problem object, with its message list, and a coroutine that can be gathered using asyncio 
+                # This makes a problem object, with its message list, and a coroutine that can be gathered using asyncio
                 gen_tasks.append((problem, messages, _generate(messages)))
 
         current: list[dict] = []
@@ -1224,7 +883,7 @@ class GRPOPipeline:
                 tasks, return_when=asyncio.FIRST_COMPLETED
             )
             for task in done:
-                tasks.remove(task) # remove it as its done
+                tasks.remove(task)  # remove it as its done
                 txt = task.result()
                 problem, messages = task_to_metadata[task]
                 if txt is None:
@@ -1232,9 +891,12 @@ class GRPOPipeline:
                 sc, reward, passed = await _score(problem, txt)
 
                 # TODO: Handle logging better, rather than each in seperate file
-                self._write_generation_log(
+                write_generation_log(
+                    self,
                     step=step,
-                    model_name=self._active_engine_adapter if use_lora else cfg.model_path,
+                    model_name=(
+                        self._active_engine_adapter if use_lora else cfg.model_path
+                    ),
                     messages=messages,
                     output=txt,
                     score=sc,
@@ -1271,15 +933,15 @@ class GRPOPipeline:
             s["overall_pass_rate"] = round(s["total_passed"] / s["total_attempts"], 3)
             s["last_pass_rate"] = round(last_passed / last_total, 3)
 
-        # Calculating pass ratio for each task, if it crosses a threshold, 
+        # Calculating pass ratio for each task, if it crosses a threshold,
         # will skip teacher refinement as GRPO signal is enough for moving gradients for that problem
         pass_ratio_by_problem: dict[str, float] = {}
         for problem in batch:
             rows = [r for r in current if r["problem"] is problem]
             if rows:
-                pass_ratio_by_problem[str(problem.id)] = (
-                    sum(1 for r in rows if r["passed"]) / len(rows)
-                )
+                pass_ratio_by_problem[str(problem.id)] = sum(
+                    1 for r in rows if r["passed"]
+                ) / len(rows)
 
         PASS_RATIO_THRESHOLD = 0.25
 
@@ -1300,14 +962,13 @@ class GRPOPipeline:
         hints_given = 0
         passed_after_hint = 0
 
-        # TODO: Bring this back for teacher refinement
-        # if cfg.max_hint_attempts > 0 and refine_candidates:
-        #     refined, hints_given, passed_after_hint = await self._teacher_refine(
-        #         refine_candidates, _generate, _score, teacher_client, sem, step
-        #     )
+        if cfg.enable_teacher and cfg.max_hint_attempts > 0 and refine_candidates:
+            refined, hints_given, passed_after_hint = await teacher_refine(
+                self, refine_candidates, _generate, _score, teacher_client, sem, step
+            )
         # _log_rollout_stats("teacher-fixes", refined, extra=f"hints={hints_given}")
 
-        self._prev_failed_rollouts = self._build_failed_cache(current)
+        self._prev_failed_rollouts = build_failed_cache(current)
         return current, refined, hints_given, passed_after_hint
 
     # TODO: understand this properly with algo
@@ -1429,351 +1090,6 @@ class GRPOPipeline:
 
         return {**algo_out.stats, **{f"bp_{k}": float(v) for k, v in bp.items()}}
 
-
-    def _sft_step(
-        self,
-        *,
-        samples: list[tuple[list[dict], str]],
-        train_model,
-        sft_optimizer,
-    ) -> float:
-        if not samples:
-            return 0.0
-
-        formatted_messages: list[list[dict]] = []
-        formatted_completions: list[str] = []
-        n_skipped = 0
-
-        for messages, completion_text in samples:
-            text = completion_text.strip()
-            if "<|im_start|>" in text or text.lstrip().startswith("assistant"):
-                n_skipped += 1
-                continue
-            if not text.endswith("<|im_end|>"):
-                text = text + "\n<|im_end|>"
-            formatted_messages.append(messages)
-            formatted_completions.append(text)
-
-        if n_skipped > 0:
-            tqdm.write(f"[sft] skipped {n_skipped}/{len(samples)} malformed samples")
-
-        if not formatted_messages:
-            return 0.0
-
-        def loss_fn_batch(
-            batch_log_probs: Tensor,
-            batch_mask: Tensor,
-            hidden_batch=None,
-        ) -> Tensor:
-            mask = batch_mask.to(batch_log_probs.device).float()
-            lengths = mask.sum(dim=1).clamp(min=1.0)
-            return (-((batch_log_probs * mask).sum(dim=1) / lengths)).mean()
-
-        bp = train_model.backward(
-            messages=formatted_messages,
-            completion_texts=formatted_completions,
-            loss_fn=loss_fn_batch,
-            loss_scale=1.0,
-        )
-        return float(bp.get("loss", 0.0))
-
-
-    async def _teacher_refine(
-        self,
-        candidates: list[dict],
-        generate_fn,
-        score_fn,
-        teacher_client,
-        sem: asyncio.Semaphore,
-        step: int,
-    ) -> tuple[list[dict], int, int]:
-        cfg = self.cfg
-        pbar = tqdm(
-            total=len(candidates) * cfg.max_hint_attempts,
-            desc="teacher-refine",
-            leave=False,
-        )
-
-        async def _refine_one(rec: dict) -> tuple[dict, int, int]:
-            MAX_PREV_ATTEMPT_CHARS = 5000
-            MAX_ERROR_CHARS = 1500
-
-            problem = rec["problem"]
-            current_text = str(rec["text"])
-            current_score = rec["score"]
-            best_text, best_score, best_reward = (
-                current_text,
-                current_score,
-                float(rec["reward"]),
-            )
-            solved = False
-            local_hints = 0
-
-            # FIX 2+5: Restored best_hint_messages / best_hint_text tracking.
-            # These are needed to build sft_hint_messages and sft_hint_text
-            # for the hint-context SFT pass.
-            best_hint_messages: Optional[list[dict]] = None
-            best_hint_text: Optional[str] = None
-            ref_answer = _sample_ref_answer(problem)
-
-            system_prompt = (
-                "You are a coding tutor helping a student fix their C code. "
-                "Each turn you will see the student's latest attempt and its "
-                "compiler/test output. Give concise targeted hints. "
-                "Tell it how to fix its errors. "
-                "Explain the API reference/theory to it that you understand from the reference material. "
-                "Tell the student model to add the explanations it understood in the comments. "
-                "If a Macro is missing, tell it to define the macro in the code itself, search the documentation for a good default value. "
-                "The student does not have access to any information or reference material, it's your job to give it all information it needs to fix its mistakes. "
-                "Make the student write everything it learns in comments (No CPP style comments) so it remembers what it saw. "
-                "Dont give it final answer directly, guide it to what it needs to change to get good answer, suggest changes and instruct it to add theory in comments. "
-                "The suggestion should be minimal, dont tell it everything, just enough to fix error"
-            )
-
-            if ref_answer:
-                system_prompt += (
-                    "\n\n[Reference solution – for YOUR guidance ONLY, "
-                    "do NOT reveal to the student]:\n"
-                    f"{ref_answer}"
-                )
-
-            if cfg.teacher_base_url:
-                teacher_base_url = cfg.teacher_base_url
-                teacher_api_key = cfg.teacher_api_key or cfg.engine_api_key
-                teacher_model = cfg.teacher_model_name
-            else:
-                teacher_base_url = cfg.engine_base_url
-                teacher_api_key = cfg.engine_api_key
-                teacher_model = cfg.model_path
-
-            local_teacher = AgentClient(
-                base_url=teacher_base_url,
-                api_key=teacher_api_key,
-                temperature=cfg.teacher_temperature,
-                max_output_tokens=cfg.teacher_max_tokens,
-                system_prompt=system_prompt,
-                model=teacher_model,
-                tools=teacher_client.tools,
-                max_turns=cfg.teacher_max_turns,
-                extra_body=self.profile.teacher_extra_body,
-            )
-
-            for attempt in range(cfg.max_hint_attempts):
-                if not current_score.compiled:
-                    status = "did not compile"
-                else:
-                    status = (
-                        f"compiled, passed {current_score.passed}/"
-                        f"{current_score.total} tests"
-                    )
-
-                error_block = ""
-                if current_score.error:
-                    error_block += f"\nError: {current_score.error}"
-                if current_score.details:
-                    error_block += f"\nTest details:\n{current_score.details}"
-                error_block = (
-                    error_block[:MAX_ERROR_CHARS] + error_block[-MAX_ERROR_CHARS:]
-                )
-
-                current_text_truncated = current_text[-MAX_PREV_ATTEMPT_CHARS:]
-                teacher_prompt = (
-                    f"Problem:\n{problem.statement}\n\n"
-                    f"Student attempt (try {attempt + 1}):\n{current_text_truncated}\n\n"
-                    f"Verifier result: {status}"
-                    f"{error_block}\n\n"
-                    "Give one concise hint to fix this."
-                )
-
-                async with sem:
-                    _, hint = await local_teacher.run(prompt=teacher_prompt)
-                local_hints += 1
-
-                retry_messages = [
-                    {
-                        "role": "user",
-                        "content": (
-                            f"{problem.statement}\n\n"
-                            f"Your previous attempt:\n{current_text_truncated}\n\n"
-                            f"Verifier result: {status}"
-                            f"{error_block}\n\n"
-                            f"Tutor hint:\n{hint}\n\n"
-                            "Fix your solution."
-                        ),
-                    },
-                ]
-
-                retry_text = await generate_fn(retry_messages)
-                pbar.update(1)
-
-                if retry_text is None:
-                    tqdm.write(
-                        f"[teacher-refine] generation failed on attempt {attempt + 1}, skipping"
-                    )
-                    continue
-
-                retry_sc, retry_reward, retry_passed = await score_fn(
-                    problem, retry_text
-                )
-                self._write_generation_log(
-                    step=step,
-                    model_name=(
-                        self._active_engine_adapter
-                        if self._lora_in_vllm
-                        else self.cfg.model_path
-                    ),
-                    messages=retry_messages,
-                    output=retry_text,
-                    score=retry_sc,
-                )
-
-                retry_reward *= cfg.hint_reward_discount
-                if retry_reward > best_reward:
-                    best_text, best_score, best_reward = (
-                        retry_text,
-                        retry_sc,
-                        retry_reward,
-                    )
-                    # FIX 5: track the messages+answer of the best hint attempt
-                    # so we can build the SFT hint pair.
-                    best_hint_messages = retry_messages
-                    best_hint_text = retry_text
-
-                current_text = retry_text
-                current_score = retry_sc
-
-                if retry_passed:
-                    solved = True
-                    # Ensure fields set even when first attempt was best
-                    if best_hint_messages is None:
-                        best_hint_messages = retry_messages
-                        best_hint_text = retry_text
-                    pbar.update(cfg.max_hint_attempts - attempt - 1)
-                    break
-
-            # --- SFT targets ---
-            sft_target: Optional[str] = None
-            sft_direct_reasoning: Optional[str] = None
-
-            def _strip_think(text: str) -> str:
-                return re.sub(
-                    r"<think>.*?</think>\s*", "", text, flags=re.DOTALL
-                ).strip()
-
-            def _as_c_block(text: Optional[str]) -> Optional[str]:
-                if not text:
-                    return None
-                text = _strip_think(text)
-                m = re.search(r"```c\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
-                code = m.group(1).strip() if m else text.strip()
-                if not code:
-                    return None
-                return f"```c\n{code}\n```"
-
-            if solved:
-                if ref_answer:
-                    sft_target = f"```c\n{ref_answer.strip()}\n```"
-                else:
-                    sft_target = _as_c_block(best_text)
-
-                if sft_target:
-                    sft_direct_reasoning = await self._generate_cot_reasoning(
-                        problem=problem,
-                        answer_code=sft_target,
-                        teacher_client=local_teacher,
-                        sem=sem,
-                    )
-
-                if sft_direct_reasoning:
-                    self._write_cot_file(
-                        step=step,
-                        reasoning=sft_direct_reasoning,
-                    )
-
-            # --- Format helper ---
-            def _fmt_completion(
-                code: Optional[str], reasoning: Optional[str]
-            ) -> Optional[str]:
-                if not code:
-                    return None
-                if reasoning:
-                    return f"<think>\n{reasoning}\n</think>\n\n{code}\n<|im_end|>"
-                return f"<think>\n </think>\n\n{code}\n<|im_end|>"
-
-            # FIX 2 (Critical): Produce sft_hint_messages + sft_hint_text.
-            # hint-context pair: the student saw (problem + prev attempt + hint)
-            # and produced best_hint_text. We train on that full context -> answer.
-            sft_hint_completion = _fmt_completion(
-                _strip_think(best_hint_text) if best_hint_text else None, None
-            )
-            sft_direct_completion = _fmt_completion(sft_target, sft_direct_reasoning)
-
-            sft_messages_direct: Optional[list[dict]] = None
-            if sft_direct_completion:
-                sft_messages_direct = [
-                    {"role": "user", "content": str(problem.statement)},
-                ]
-
-            return (
-                dict(
-                    problem=problem,
-                    messages=[
-                        {"role": "system", "content": cfg.system_prompt},
-                        {"role": "user", "content": str(problem.statement)},
-                    ],
-                    text=best_text,
-                    score=best_score,
-                    reward=best_reward,
-                    passed=solved,
-                    # FIX 2 (Critical): restored sft_hint_* fields
-                    sft_hint_messages=best_hint_messages,
-                    sft_hint_text=sft_hint_completion,
-                    # direct pair unchanged
-                    sft_direct_messages=sft_messages_direct,
-                    sft_direct_text=sft_direct_completion,
-                ),
-                local_hints,
-                int(solved),
-            )
-
-        results = await asyncio.gather(*[_refine_one(rec) for rec in candidates])
-        pbar.close()
-
-        refined, hints_given, passed_after_hint = [], 0, 0
-        for result, h, p in results:
-            refined.append(result)
-            hints_given += h
-            passed_after_hint += p
-        return refined, hints_given, passed_after_hint
-
-
-    def _build_failed_cache(self, current: list[dict]) -> list[dict]:
-        by_problem: dict[int, list[dict]] = {}
-        for r in current:
-            by_problem.setdefault(id(r["problem"]), []).append(r)
-
-        cache: list[dict] = []
-        for rows in by_problem.values():
-            passed = [r for r in rows if r["passed"]]
-            peer = (
-                str(max(passed, key=lambda x: x["reward"])["text"])
-                if passed
-                else None
-            )
-            for r in rows:
-                if not r["passed"]:
-                    cache.append(
-                        dict(
-                            problem=r["problem"],
-                            text=r["text"],
-                            score=r["score"],
-                            reward=r["reward"],
-                            peer_solution=peer,
-                        )
-                    )
-        return cache
-
-
     async def _engine_init(self, engine) -> None:
         try:
             await engine.init()
@@ -1804,107 +1120,5 @@ class GRPOPipeline:
         await engine.shutdown()
         tqdm.write("engine: shutdown complete")
 
-    async def _generate_cot_reasoning(
-        self,
-        *,
-        problem,
-        answer_code: str,
-        teacher_client,
-        sem: asyncio.Semaphore,
-    ) -> Optional[str]:
-        cfg = self.cfg
-        profile = self.profile
-
-        cot_client = AgentClient(
-            base_url=cfg.teacher_base_url or cfg.engine_base_url,
-            api_key=cfg.teacher_api_key or cfg.engine_api_key,
-            temperature=cfg.teacher_temperature,
-            max_output_tokens=cfg.teacher_max_tokens,
-            system_prompt=COT_SYSTEM_PROMPT,
-            model=cfg.teacher_model_name or cfg.model_path,
-            tools=teacher_client.tools,
-            max_turns=cfg.teacher_max_turns,
-            extra_body=profile.teacher_extra_body,
-        )
-
-        cot_prompt = (
-            f"Problem:\n{problem.statement}\n\n"
-            f"Correct C solution:\n{answer_code}\n\n"
-            "Using your tools, research the APIs, theory, and implementation "
-            "details relevant to this solution. Then write the internal reasoning "
-            "an expert would have had when arriving at this exact solution. "
-            "Plain text only, no code blocks, no markdown. "
-            "You have the tools, dont make guesses, be deterministic, but no need to "
-            "understand everything, dont write about something you dont know. "
-            "Bad example (DONT DO THIS!): 'The function is likely part of PMF (process management library)' "
-            "– this means you dont know whats happening, better to not write this. "
-            "Minimally understand about the functions you are working with and write. "
-            "Bad example: 'The expert programmer begins by analyzing...' "
-            "Good example: 'The user asked for ...(details in brief)... so i need to use ... function and do ...' "
-            "It should be very short, a paragraph with a few lines is enough, be concise and minimal, "
-            "around 100-200 words is enough"
-        )
-
-        try:
-            async with sem:
-                _, reasoning = await cot_client.run(prompt=cot_prompt)
-            if not reasoning:
-                return None
-            reasoning = reasoning.strip()
-
-            # If >1500 chars, summarize using LangChain OpenAI with same URL/key/model
-            if len(reasoning) > 1500:
-                summarizer = ChatOpenAI(
-                    model=cfg.teacher_model_name or cfg.model_path,
-                    base_url=cfg.teacher_base_url or cfg.engine_base_url,
-                    api_key=cfg.teacher_api_key or cfg.engine_api_key,
-                    temperature=0.5,
-                )
-                summary_prompt = (
-                    "Summarize the following reasoning in under 1500 characters "
-                    "keeping the key details, plain text only:\n\n" + reasoning
-                )
-                resp = summarizer.invoke([HumanMessage(content=summary_prompt)])
-                summary = resp.content.strip() if resp else None
-                if not summary or len(summary) > 1500:
-                    return None
-                return summary
-
-            return reasoning
-
-        except Exception as exc:
-            tqdm.write(f"[cot-gen] warning: failed to generate COT reasoning: {exc}")
-            return None
-
-    def _write_cot_file(self, *, step: int, reasoning: str) -> None:
-        log_dir = Path("gen_logs") / f"step_{step}"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
-        path = log_dir / f"cot_{ts}.md"
-        with path.open("w", encoding="utf-8") as f:
-            f.write("<think>\n")
-            f.write(reasoning.strip())
-            f.write("\n</think>\n")
 
 # endregion Pipeline
-
-# TODO: Move this to util
-def _log_rollout_stats(tag: str, rows: list[dict], extra: str = "") -> None:
-    if not rows:
-        return
-    ratios = [
-        (float(r["score"].passed) / float(r["score"].total))
-        if r["score"].total > 0
-        else 0.0
-        for r in rows
-    ]
-    n_pass = sum(1 for r in rows if r["passed"])
-    parts = [
-        f"[{tag}]",
-        f"n={len(rows)}",
-        f"mean_score={sum(ratios) / max(1, len(ratios)):.3f}",
-        f"passed={n_pass}/{len(rows)}",
-    ]
-    if extra:
-        parts.append(extra)
-    tqdm.write(" ".join(parts))
