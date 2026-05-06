@@ -14,9 +14,9 @@ async def _run() -> None:
     base_url = os.environ.get("BASE_URL", "http://localhost:8000/v1")
     model_path = os.environ.get(
         "MODEL_PATH",
-        "/media/blazingbhavneek/Common/Code/sglangServer/Infer/Qwen/Qwen3-1.7B",
+        "/run/media/blaze/Common/Code/sglangServer/Infer/Qwen/Qwen3-1.7B",
     )
-    docs_folder = "/media/blazingbhavneek/Common/Code/rl/sft_primer/input/intel/test.md"
+    docs_folder = "/run/media/blaze/Common/Code/rl/sft_primer/input/intel/test.md"
 
     embedding_backend = os.environ.get("EMBEDDING_BACKEND", "huggingface")
     embedding_base_url = os.environ.get("EMBEDDING_BASE_URL", base_url)

@@ -17,7 +17,7 @@ async def _run() -> None:
     base_url = os.environ.get("BASE_URL", "http://localhost:8000/v1")
     model_path = os.environ.get(
         "MODEL_PATH",
-        "/media/blazingbhavneek/Common/Code/sglangServer/Infer/Qwen/Qwen3-1.7B",
+        "/run/media/blaze/Common/Code/sglangServer/Infer/Qwen/Qwen3-1.7B",
     )
 
     print("=== Client Chat Test ===")

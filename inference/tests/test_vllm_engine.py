@@ -5,9 +5,9 @@ from pathlib import Path
 from inference.vllm_engine import VLLMEngine
 
 BASE_URL = "http://localhost:8000/v1"
-MODEL = "/media/blazingbhavneek/Common/Code/sglangServer/Infer/Qwen/Qwen3-1.7B"
+MODEL = "/run/media/blaze/Common/Code/sglangServer/Infer/Qwen/Qwen3-1.7B"
 LORA_ROOT = (
-    "/media/blazingbhavneek/Common/Code/rl/sft_primer/output/intel/lora/"
+    "/run/media/blaze/Common/Code/rl/sft_primer/output/intel/lora/"
     "media_blazingbhavneek_Common_Code_sglangServer_Infer_Qwen_Qwen3-1.7B"
 )
 LORA_ADAPTERS = [

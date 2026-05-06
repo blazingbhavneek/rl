@@ -1,3 +1,17 @@
+# LoRA adapter save/load normalization utilities.
+#
+# LoRA (Low-Rank Adaptation) works by adding a small pair of matrices (A and B,
+# rank r << hidden_dim) to each target linear layer. Instead of updating the full
+# weight matrix W, the update is: W_new = W + (B @ A) * (alpha/r).
+# This means we only need to save/load A and B, which is much smaller than W.
+#
+# This file handles one specific problem: our streaming wrappers rename layers
+# (e.g. layers.5.self_attn becomes layers.5.base_layer.self_attn.base_attn).
+# When PEFT saves adapter weights, the keys in the file reflect those wrapper names.
+# But if you load that file on a model without the wrappers, the keys won't match.
+# The normalization functions here strip the wrapper-specific path segments so
+# the saved adapter files are portable and standard-PEFT-compatible.
+
 import json
 import re
 import shutil
@@ -9,13 +23,19 @@ from safetensors.torch import load_file as load_safetensors_file
 from safetensors.torch import save_file as save_safetensors_file
 
 _ADAPTER_CONFIG_NAME = "adapter_config.json"
-_ADAPTER_SAFE_NAME = "adapter_model.safetensors"
-_ADAPTER_BIN_NAME = "adapter_model.bin"
+_ADAPTER_SAFE_NAME = "adapter_model.safetensors"  # Modern PEFT save format
+_ADAPTER_BIN_NAME = "adapter_model.bin"            # Legacy PyTorch format
+
+# Matches ".layers.5." inside a tensor key name, capturing the index (5).
 _LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+
+# Matches ".layers.5.base_layer." — the extra segment added by _StreamGemmaDecoderLayer.
+# We replace it with just ".layers.5." to undo the wrapper rename.
 _WRAPPED_LAYER_RE = re.compile(r"(\.layers\.\d+)\.base_layer\.")
 
 
 def _coerce_str_list(value) -> list[str]:
+    # Safely convert None / a single string / a list into a list of strings.
     if value is None:
         return []
     if isinstance(value, str):
@@ -24,6 +44,7 @@ def _coerce_str_list(value) -> list[str]:
 
 
 def _coerce_int_list(value) -> list[int]:
+    # Same idea but for integers, and deduplicates + sorts.
     if value is None:
         return []
     if isinstance(value, int):
@@ -32,10 +53,16 @@ def _coerce_int_list(value) -> list[int]:
 
 
 def _lora_target_leaf(target: str) -> str:
+    # Extract the final module name from a dotted path.
+    # e.g. "model.layers.5.self_attn.q_proj" → "q_proj"
+    # We only need the leaf name because PEFT matches by leaf when layers_to_transform is set.
     return str(target).rsplit(".", 1)[-1]
 
 
 def _layer_indices_from_names(names: list[str]) -> list[int]:
+    # Given a list of tensor key names, extract the layer indices they belong to.
+    # e.g. ["base_model.model.model.layers.26.self_attn.q_proj.lora_A.weight"] → [26]
+    # Used to infer which layers a saved adapter covers, without reading the config.
     indices = set()
     for name in names:
         match = _LAYER_INDEX_RE.search(str(name))
@@ -45,11 +72,15 @@ def _layer_indices_from_names(names: list[str]) -> list[int]:
 
 
 def _normalize_lora_state_key(key: str) -> str:
+    # Strip wrapper-specific segments from a tensor key so it matches standard PEFT naming.
+    # Step 1: ".layers.5.base_layer.self_attn..." → ".layers.5.self_attn..."
     key = _WRAPPED_LAYER_RE.sub(r"\1.", key)
+    # Step 2: ".self_attn.base_attn." → ".self_attn."  (from _StreamGemmaAttention wrapper)
     return key.replace(".self_attn.base_attn.", ".self_attn.")
 
 
 def _adapter_state_path(adapter_dir: Path) -> Path | None:
+    # Return the path to the adapter weights file, preferring .safetensors over .bin.
     safe_path = adapter_dir / _ADAPTER_SAFE_NAME
     if safe_path.exists():
         return safe_path
@@ -60,6 +91,8 @@ def _adapter_state_path(adapter_dir: Path) -> Path | None:
 
 
 def _adapter_state_keys(state_path: Path | None) -> list[str]:
+    # Return the list of tensor names stored in the adapter weights file.
+    # For .safetensors we can read just the keys without loading all the tensors into memory.
     if state_path is None:
         return []
     if state_path.name == _ADAPTER_SAFE_NAME:
@@ -72,6 +105,8 @@ def _adapter_state_keys(state_path: Path | None) -> list[str]:
 
 
 def _adapter_safetensors_metadata(state_path: Path) -> dict[str, str] | None:
+    # Read the optional string metadata stored in the safetensors header.
+    # PEFT uses this for format_version, etc. We preserve it during normalization.
     with safe_open(str(state_path), framework="pt", device="cpu") as handle:
         return handle.metadata()
 
@@ -91,7 +126,12 @@ def _write_adapter_config_dict(adapter_dir: Path, config_data: dict) -> None:
 
 
 def _normalized_lora_config_dict(config_data: dict, state_keys: list[str]) -> dict:
+    # Produce a canonical version of adapter_config.json:
+    #   - target_modules: only the leaf names (no full paths), sorted
+    #   - layers_to_transform: the actual layer indices, inferred from state keys if missing
+    #   - layers_pattern: always "layers" so PEFT knows how to find them
     normalized = dict(config_data)
+
     targets = _coerce_str_list(normalized.get("target_modules"))
     if targets:
         normalized["target_modules"] = sorted(
@@ -101,6 +141,7 @@ def _normalized_lora_config_dict(config_data: dict, state_keys: list[str]) -> di
     target_layers = _layer_indices_from_names(targets)
     configured_layers = _coerce_int_list(normalized.get("layers_to_transform"))
     state_layers = _layer_indices_from_names(state_keys)
+    # Priority: explicit target paths > config field > inferred from saved tensor names
     layer_indices = target_layers or configured_layers or state_layers
     if layer_indices:
         normalized["layers_to_transform"] = layer_indices
@@ -110,6 +151,8 @@ def _normalized_lora_config_dict(config_data: dict, state_keys: list[str]) -> di
 
 
 def _normalize_adapter_state_file(src: Path, dst: Path) -> None:
+    # Rewrite every tensor key in the adapter weights file using _normalize_lora_state_key,
+    # then save to dst. This strips wrapper path segments so the file is portable.
     if src.name == _ADAPTER_SAFE_NAME:
         tensors = load_safetensors_file(str(src), device="cpu")
         metadata = _adapter_safetensors_metadata(src)
@@ -141,6 +184,9 @@ def _normalize_adapter_state_file(src: Path, dst: Path) -> None:
 def _normalize_lora_adapter_dir(
     adapter_dir: Path, output_dir: Path | None = None
 ) -> Path:
+    # Main entry point: normalize both the config and the weights in an adapter directory.
+    # If output_dir is None, modifies in-place (writes to a temp file then replaces).
+    # If output_dir is provided, writes the clean version there (used during load).
     adapter_dir = adapter_dir.expanduser().resolve()
     if not adapter_dir.is_dir():
         raise FileNotFoundError(f"LoRA adapter path not found: {adapter_dir}")
@@ -153,7 +199,7 @@ def _normalize_lora_adapter_dir(
     dirty_state = any(_normalize_lora_state_key(key) != key for key in state_keys)
 
     if output_dir is None and not dirty_config and not dirty_state:
-        return adapter_dir
+        return adapter_dir  # Already clean, nothing to do
 
     target_dir = adapter_dir if output_dir is None else output_dir
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -163,6 +209,8 @@ def _normalize_lora_adapter_dir(
         target_state_path = target_dir / state_path.name
         if dirty_state or target_state_path != state_path:
             if dirty_state:
+                # Write to a temp file first, then atomically rename — avoids
+                # a corrupt state if the process dies mid-write.
                 write_path = target_state_path
                 if target_state_path == state_path:
                     write_path = target_state_path.with_name(
@@ -178,22 +226,30 @@ def _normalize_lora_adapter_dir(
 
 
 def _assert_clean_lora_adapter_dir(adapter_dir: Path) -> None:
+    # Sanity check after saving: verify the adapter directory meets all requirements
+    # that make it loadable by standard PEFT on any model variant (with or without wrappers).
     config_data = _load_adapter_config_dict(adapter_dir)
+
     targets = config_data.get("target_modules")
     if not isinstance(targets, list) or not targets:
         raise RuntimeError(
             "Gemma4 LoRA adapter must save leaf target_modules as a non-empty list"
         )
+
+    # Make sure no full dotted paths snuck in — PEFT expects leaf names only.
     full_targets = [target for target in targets if "." in str(target)]
     if full_targets:
         raise RuntimeError(
             f"Gemma4 LoRA adapter saved full target paths: {full_targets[:3]}"
         )
+
     if not config_data.get("layers_to_transform"):
         raise RuntimeError("Gemma4 LoRA adapter saved without layers_to_transform")
+
     if config_data.get("layers_pattern") != "layers":
         raise RuntimeError("Gemma4 LoRA adapter saved without layers_pattern='layers'")
 
+    # Make sure no wrapper-specific key names ended up in the saved weights.
     bad_keys = [
         key
         for key in _adapter_state_keys(_adapter_state_path(adapter_dir))

@@ -5,3 +5,4 @@ outputs/chunk_profile_test/
 .vscode
 logs/
 .claude/
+**.csv

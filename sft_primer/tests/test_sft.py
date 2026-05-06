@@ -11,9 +11,9 @@ from sft_primer.train import detect_model_family, train_model_on_qa_pairs
 # Config — edit these before running
 # ---------------------------------------------------------------------------
 
-INPUT_FOLDER_PATH = Path("/media/blazingbhavneek/Common/Code/rl/sft_primer/input/intel")
+INPUT_FOLDER_PATH = Path("/run/media/blaze/Common/Code/rl/sft_primer/input/intel")
 MODEL_PATH = (
-    "/media/blazingbhavneek/Common/Code/sglangServer/Infer/google/gemma-4-E2B-it"
+    "/run/media/blaze/Common/Code/sglangServer/Infer/google/gemma-4-E2B-it"
 )
 
 TRAIN_EPOCHS = 5
@@ -30,7 +30,7 @@ INFER_MAX_NEW_TOKENS = 8192
 GPU_MEMORY_UTILIZATION = 0.90
 SAVE_EVERY_STEPS = 50  # save LoRA every N optimizer steps; 0 = disabled
 QA_PAIRS_PATH = Path(
-    "/media/blazingbhavneek/Common/Code/rl/sft_primer/output/intel/qa_pair.jsonl"
+    "/run/media/blaze/Common/Code/rl/sft_primer/output/intel/qa_pair.jsonl"
 )
 
 # ---------------------------------------------------------------------------

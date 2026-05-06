@@ -5,9 +5,9 @@ from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 MODEL_PATH = (
-    "/media/blazingbhavneek/Common/Code/sglangServer/Infer/google/gemma-4-E2B-it"
+    "/run/media/blaze/Common/Code/sglangServer/Infer/google/gemma-4-E2B-it"
 )
-ADAPTER_PATH = "/media/blazingbhavneek/Common/Code/rl/sft_primer/output/intel/lora/media_blazingbhavneek_Common_Code_sglangServer_Infer_google_gemma-4-E2B-it/epoch_1/"
+ADAPTER_PATH = "/run/media/blaze/Common/Code/rl/sft_primer/output/intel/lora/media_blazingbhavneek_Common_Code_sglangServer_Infer_google_gemma-4-E2B-it/epoch_1/"
 PROMPT = "Explain what LLVM is in two short bullet points."
 MAX_NEW_TOKENS = 128
 

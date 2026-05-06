@@ -14,7 +14,7 @@ warnings.filterwarnings(
 )
 
 DEFAULT_GEMMA4_MODEL_PATH = (
-    "/media/blazingbhavneek/Common/Code/sglangServer/Infer/google/gemma-4-E2B-it"
+    "/run/media/blaze/Common/Code/sglangServer/Infer/google/gemma-4-E2B-it"
 )
 DEFAULT_GEMMA4_LORA_TARGETS = [
     "q_proj",
