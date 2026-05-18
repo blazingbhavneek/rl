@@ -11,7 +11,9 @@ class Problem:
     difficulty_label: str
     metadata: Dict = field(default_factory=dict)
 
-
+# Code centric for now
+# TODO: Make it general for all kinds of tasks
+# TODO: Make the total optional for compile only smoke tasks
 @dataclass
 class Score:
     # Raw verifier output. Reward shaping belongs to pipeline code.
@@ -19,7 +21,7 @@ class Score:
     passed: int
     total: int
     error: Optional[str] = None
-    details: Dict = field(default_factory=dict)
+    details: Dict = field(default_factory=dict) # TODO: what are these?
 
 
 @dataclass
@@ -32,7 +34,7 @@ class ProblemState:
     last_sampled_step: int = -1
     promoted: bool = False
 
-
+# For making sure verifiers have certain methods implemented, this will be called by (TODO: Find this)
 class BaseVerifier(ABC):
     """Verifier interface shared across tasksets."""
 

@@ -4,7 +4,11 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 
 from .base import ProblemState
 
-
+# Bucket sampler, a bucket is a group of problems with similar difficulty
+# the core idea is to show the LLM more easier problems first, but not all together to 
+# avoid overfitting over a kind of problem, as the model gets better, the mean
+# of sampler will move towards right, sampling more difficult problems for 
+# consistent learning signal for the RL algorithms
 class BucketDistribution:
 
     # What this does:
@@ -19,10 +23,10 @@ class BucketDistribution:
     # - exhaustion_threshold: per-problem solve rate to count as solved at the end.
     def __init__(
         self,
-        n_buckets: int,
-        initial_mean: float,
-        std: float,
-        shift_success_ratio: float = 0.7,
+        n_buckets: int, # number of difficulty levels
+        initial_mean: float, # where to begin
+        std: float, # standard deviation of the bell curve
+        shift_success_ratio: float = 0.7, # TODO: What are these?
         exhaustion_ratio: float = 0.8,
         exhaustion_threshold: float = 0.8,
     ) -> None:
@@ -35,20 +39,17 @@ class BucketDistribution:
         self.exhaustion_ratio = float(exhaustion_ratio)
         self.exhaustion_threshold = float(exhaustion_threshold)
 
-    # What this does:
-    # - Return sampling probability for each bucket.
-    #
-    # Parameter meanings:
-    # - Uses self.mean and self.std set in the class state.
-    #
-    # Behavior:
-    # - If std <= 0, sampling is fixed to one bucket (round(mean)).
-    # - Otherwise, use a Gaussian-like shape around mean and normalize.
+    # Return sampling probability for each bucket.
+    # If std <= 0, sampling is fixed to one bucket (round(mean));
+    # otherwise the buckets follow a normalized Gaussian-like shape around mean.
     def get_probs(self) -> List[float]:
+
+        # TODO: What does negative std means? or does it mean something else than std deviation?
         if self.std <= 0:
             idx = int(round(self.mean))
             return [1.0 if i == idx else 0.0 for i in range(self.n_buckets)]
-
+        
+        # TODO: Add mathematical explanation for this block
         weights = []
         for i in range(self.n_buckets):
             z = (i - self.mean) / self.std
@@ -58,14 +59,8 @@ class BucketDistribution:
             return [1.0 / self.n_buckets] * self.n_buckets
         return [w / s for w in weights]
 
-    # What this does:
-    # - Move curriculum center to harder buckets.
-    #
-    # Parameter meanings:
-    # - delta: amount to move mean to the right.
-    #
-    # Notes:
-    # - Mean is capped at the last bucket index.
+    # Move curriculum center to harder buckets.
+    # TODO: add a left shift if the model gets worse.
     def shift_right(self, delta: float) -> None:
         self.mean = min(self.n_buckets - 1, self.mean + float(delta))
 
@@ -100,7 +95,13 @@ class BucketDistribution:
         evaluated = len(in_window)
         if evaluated < min_evaluated:
             return False
-
+        
+        # mastered problems are the one with high solve rate and high consecutive success rate
+        # the consecutive success rate critera is to reduce numbers of "lucky rollouts"
+        # meaning of probability of llm solving a problem is 5%, then out of 100, 5 will pass even tho
+        # llm hasnt mastered it yet, but if the requirement is 2 consecutive passes then it becomes 0.0025,
+        # which is 0.25%, which is very low, solve rate threshold has to be low for difficult problems since llms
+        # will have to try them sometimes for potential learning signal, if not then back to easier problems
         mastered = [
             s
             for s in in_window
@@ -109,41 +110,37 @@ class BucketDistribution:
         ]
         return (len(mastered) / evaluated) >= self.shift_success_ratio
 
-    # What this does:
-    # - Check if curriculum is finished.
-    #
-    # Parameter meanings:
-    # - states: all tracked problem states.
-    #
-    # Logic:
-    # - First ensure the current distribution is centered on last bucket.
-    # - In last bucket, count problem as solved if:
-    #   promoted is True, or solve_rate >= exhaustion_threshold.
-    # - If solved ratio reaches exhaustion_ratio, return True.
+    # Check if curriculum is finished.
+    # First ensure the current distribution is centered on the last bucket.
     def is_exhausted(self, states: Iterable[ProblemState]) -> bool:
+
+        # get probability distribution over buckets
         probs = self.get_probs()
+
+        # mode index (bucket of highes probability)
         mode = max(range(self.n_buckets), key=lambda i: probs[i])
+
+        # if not last bucket, it means the llm still not highest capability
         if mode != self.n_buckets - 1:
             return False
-
+        
+        # All the highest difficulty problems, even if the mean is in the highest we still will have 
+        # some relatively easier problems sampled
         right_states = [s for s in states if s.bucket == self.n_buckets - 1]
+
+        # if no problems from last bucket then false
         if not right_states:
             return False
-
+        
+        # If solved rate of difficult problems is over a threshold then mark them successfulll
+        # If amount of successfull problems are over a particular ratio, then the final bucket is mastered
         solved = 0
         for s in right_states:
             if s.promoted or s.solve_rate >= self.exhaustion_threshold:
                 solved += 1
         return (solved / len(right_states)) >= self.exhaustion_ratio
 
-    # What this does:
-    # - Save current distribution settings into a dict.
-    #
-    # Parameter meanings:
-    # - No input parameters.
-    #
-    # Return:
-    # - A JSON-serializable dict used for checkpoints.
+    # Save current distribution settings into a dict for checkpoints.
     def export(self) -> Dict:
         return {
             "n_buckets": self.n_buckets,
@@ -154,11 +151,7 @@ class BucketDistribution:
             "exhaustion_threshold": self.exhaustion_threshold,
         }
 
-    # What this does:
-    # - Load distribution settings from a dict (usually checkpoint data).
-    #
-    # Parameter meanings:
-    # - state: dict containing bucket count, mean, std, and threshold values.
+    # Load distribution settings from a dict, usually from checkpoint data.
     def load(self, state: Dict) -> None:
         self.n_buckets = int(state["n_buckets"])
         self.mean = float(state["mean"])
